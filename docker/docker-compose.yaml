@@ -1,0 +1,279 @@
+name: lgtm-boutique
+
+# ── Networks ──────────────────────────────────────────────────────────────────
+networks:
+  observability:
+    driver: bridge
+  boutique:
+    driver: bridge
+
+# ── Volumes (persisted) ───────────────────────────────────────────────────────
+volumes:
+  prometheus-data:
+  grafana-data:
+  tempo-data:
+
+# ═══════════════════════════════════════════════════════════════════════════════
+services:
+
+# ── OBSERVABILITY STACK ────────────────────────────────────────────────────────
+
+  prometheus:
+    platform: linux/amd64
+    image: prom/prometheus:v2.51.2
+    container_name: prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yaml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-remote-write-receiver        # Alloy pushes metrics here
+      - --web.enable-lifecycle
+    volumes:
+      - ./config/prometheus.yaml:/etc/prometheus/prometheus.yaml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - observability
+
+  loki:
+    platform: linux/amd64
+    image: grafana/loki:3.0.0
+    container_name: loki
+    user: "0"
+    restart: unless-stopped
+    command: -config.file=/etc/loki/loki.yaml
+    volumes:
+      - ./config/loki.yaml:/etc/loki/loki.yaml:ro
+    ports:
+      - "3100:3100"
+    networks:
+      - observability
+
+  tempo:
+    platform: linux/amd64
+    image: grafana/tempo:2.4.1
+    container_name: tempo
+    restart: unless-stopped
+    command: -config.file=/etc/tempo/tempo.yaml
+    volumes:
+      - ./config/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    ports:
+      - "3200:3200"   # Tempo HTTP API (Grafana datasource)
+      - "4417:4317"   # OTLP gRPC  ← different host port to avoid clash with Alloy
+      - "4418:4318"   # OTLP HTTP
+    networks:
+      - observability
+      - boutique
+
+  alloy:
+    platform: linux/amd64
+    image: grafana/alloy:v1.5.1
+    container_name: alloy
+    restart: unless-stopped
+    command:
+      - run
+      - /etc/alloy/config.alloy
+      - --stability.level=experimental
+      - --server.http.listen-addr=0.0.0.0:12345
+    volumes:
+      - ./config/alloy.alloy:/etc/alloy/config.alloy:ro
+    ports:
+      - "12345:12345"  # Alloy UI
+      - "4317:4317"    # OTLP gRPC  ← boutique services send here
+      - "4318:4318"    # OTLP HTTP
+    networks:
+      - observability
+      - boutique        # needs to receive from boutique services
+    depends_on:
+      - prometheus
+      - loki
+      - tempo
+
+  grafana:
+    platform: linux/amd64
+    image: grafana/grafana:11.0.0
+    container_name: grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_ANALYTICS_REPORTING_ENABLED=false
+      - GF_FEATURE_TOGGLES_ENABLE=traceToMetrics
+    volumes:
+      - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    networks:
+      - observability
+    depends_on:
+      - prometheus
+      - loki
+      - tempo
+
+# ── ONLINE BOUTIQUE ────────────────────────────────────────────────────────────
+# Each service gets OTEL env vars pointing at Alloy
+
+  emailservice:
+    platform: linux/amd64
+    image: gcr.io/google-samples/microservices-demo/emailservice:v0.10.1
+    container_name: emailservice
+    restart: unless-stopped
+    environment:
+      - PORT=8080
+      - DISABLE_PROFILER=1
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://alloy:4317
+      - OTEL_SERVICE_NAME=emailservice
+      - ENABLE_TRACING=1
+    networks: [boutique]
+
+  productcatalogservice:
+    platform: linux/amd64
+    image: gcr.io/google-samples/microservices-demo/productcatalogservice:v0.10.1
+    container_name: productcatalogservice
+    restart: unless-stopped
+    environment:
+      - PORT=3550
+      - DISABLE_PROFILER=1
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://alloy:4317
+      - OTEL_SERVICE_NAME=productcatalogservice
+      - ENABLE_TRACING=1
+    networks: [boutique]
+
+  recommendationservice:
+    platform: linux/amd64
+    image: gcr.io/google-samples/microservices-demo/recommendationservice:v0.10.1
+    container_name: recommendationservice
+    restart: unless-stopped
+    environment:
+      - PORT=8080
+      - DISABLE_PROFILER=1
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://alloy:4317
+      - OTEL_SERVICE_NAME=recommendationservice
+      - ENABLE_TRACING=1
+      - PRODUCT_CATALOG_SERVICE_ADDR=productcatalogservice:3550
+    networks: [boutique]
+
+  shippingservice:
+    platform: linux/amd64
+    image: gcr.io/google-samples/microservices-demo/shippingservice:v0.10.1
+    container_name: shippingservice
+    restart: unless-stopped
+    environment:
+      - PORT=50051
+      - DISABLE_PROFILER=1
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://alloy:4317
+      - OTEL_SERVICE_NAME=shippingservice
+      - ENABLE_TRACING=1
+    networks: [boutique]
+
+  checkoutservice:
+    platform: linux/amd64
+    image: gcr.io/google-samples/microservices-demo/checkoutservice:v0.10.1
+    container_name: checkoutservice
+    restart: unless-stopped
+    environment:
+      - PORT=5050
+      - DISABLE_PROFILER=1
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://alloy:4317
+      - OTEL_SERVICE_NAME=checkoutservice
+      - ENABLE_TRACING=1
+      - PRODUCT_CATALOG_SERVICE_ADDR=productcatalogservice:3550
+      - SHIPPING_SERVICE_ADDR=shippingservice:50051
+      - PAYMENT_SERVICE_ADDR=paymentservice:50051
+      - EMAIL_SERVICE_ADDR=emailservice:8080
+      - CURRENCY_SERVICE_ADDR=currencyservice:7000
+      - CART_SERVICE_ADDR=cartservice:7070
+    networks: [boutique]
+
+  paymentservice:
+    platform: linux/amd64
+    image: gcr.io/google-samples/microservices-demo/paymentservice:v0.10.1
+    container_name: paymentservice
+    restart: unless-stopped
+    environment:
+      - PORT=50051
+      - DISABLE_PROFILER=1
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://alloy:4317
+      - OTEL_SERVICE_NAME=paymentservice
+      - ENABLE_TRACING=1
+    networks: [boutique]
+
+  currencyservice:
+    platform: linux/amd64
+    image: gcr.io/google-samples/microservices-demo/currencyservice:v0.10.1
+    container_name: currencyservice
+    restart: unless-stopped
+    environment:
+      - PORT=7000
+      - DISABLE_PROFILER=1
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://alloy:4317
+      - OTEL_SERVICE_NAME=currencyservice
+      - ENABLE_TRACING=1
+    networks: [boutique]
+
+  cartservice:
+    platform: linux/amd64
+    image: gcr.io/google-samples/microservices-demo/cartservice:v0.10.1
+    container_name: cartservice
+    restart: unless-stopped
+    environment:
+      - REDIS_ADDR=redis:6379
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://alloy:4317
+      - OTEL_SERVICE_NAME=cartservice
+      - ENABLE_TRACING=1
+    networks: [boutique]
+    depends_on: [redis]
+
+  redis:
+    platform: linux/amd64
+    image: redis:alpine
+    container_name: redis
+    restart: unless-stopped
+    networks: [boutique]
+
+  adservice:
+    platform: linux/amd64
+    image: gcr.io/google-samples/microservices-demo/adservice:v0.10.1
+    container_name: adservice
+    restart: unless-stopped
+    environment:
+      - PORT=9555
+      - DISABLE_PROFILER=1
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://alloy:4317
+      - OTEL_SERVICE_NAME=adservice
+      - ENABLE_TRACING=1
+    networks: [boutique]
+
+  frontend:
+    platform: linux/amd64
+    image: gcr.io/google-samples/microservices-demo/frontend:v0.10.1
+    container_name: frontend
+    restart: unless-stopped
+    environment:
+      - PORT=8080
+      - DISABLE_PROFILER=1
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://alloy:4317
+      - OTEL_SERVICE_NAME=frontend
+      - ENABLE_TRACING=1
+      - PRODUCT_CATALOG_SERVICE_ADDR=productcatalogservice:3550
+      - CURRENCY_SERVICE_ADDR=currencyservice:7000
+      - CART_SERVICE_ADDR=cartservice:7070
+      - RECOMMENDATION_SERVICE_ADDR=recommendationservice:8080
+      - SHIPPING_SERVICE_ADDR=shippingservice:50051
+      - CHECKOUT_SERVICE_ADDR=checkoutservice:5050
+      - AD_SERVICE_ADDR=adservice:9555
+      - SHOPPING_ASSISTANT_SERVICE_ADDR=shoppingassistantservice:80
+    ports:
+      - "8080:8080"
+    networks: [boutique]
+    depends_on:
+      - productcatalogservice
+      - currencyservice
+      - cartservice
+      - recommendationservice
+      - shippingservice
+      - checkoutservice
+      - adservice

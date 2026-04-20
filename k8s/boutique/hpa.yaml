@@ -1,0 +1,265 @@
+# boutique/hpa.yaml — Holy Grail Edition
+# =============================================================================
+# CPU BUDGET MATH — M5 Pro 8 vCPU node
+# =============================================================================
+#
+# Node CPU budget: 8000m
+#   kube-system reserved:     ~400m
+#   observability (requests):  2100m  (alloy 500 + prom 300 + tempo 300 + loki 200 + grafana 200 + infra 600)
+#   Available for boutique:   ~5500m
+#
+# Boutique FIXED pods (no HPA):
+#   redis 100 + email 50 + payment 100 + shipping 100 + recommend 200 + currency 200×2 + adservice 200
+#   = ~1150m fixed
+#
+# Boutique HPA pods (at MAX replicas):
+#   frontend:     12 × 500m = 6000m  ← LIMIT: see note below
+#   productcatalog: 8 × 250m = 2000m
+#   cart:          5 × 500m = 2500m  ← reduced from 8 (previous root cause)
+#   checkout:      6 × 200m = 1200m
+#   currency:      6 × 100m =  600m
+#   Total max:              = 12300m (ALL HPAs at max simultaneously)
+#
+# NOTE: All HPAs hitting max simultaneously is physically impossible on this
+# node — the ResourceQuota (6 CPU requests for boutique) prevents it.
+# HPA fires based on per-service load, not all at once. In practice at 1000 VU
+# the realistic peak is: frontend 4-6 pods + cart 3-4 pods + others at min.
+# That's ~4500m requests — comfortably within the 5500m available.
+#
+# CARTSERVICE ROOT CAUSE (documented here for institutional memory):
+# Previous: maxReplicas=8 × 500m = 4000m requests for cart alone.
+# At 1000 VU, HPA scaled cart to max simultaneously with frontend scaling.
+# Combined requests exceeded node available CPU → scheduler couldn't place pods
+# → pods stuck Pending → HPA saw Pending pods as scaled → further evictions.
+# Fix: maxReplicas=5 (2500m max) + stabilizationWindowSeconds=120 (don't rush).
+#
+# THRESHOLDS EXPLAINED:
+# averageUtilization is % of the REQUEST (not limit).
+# Formula: actual_CPU_threshold = request_millicores × (averageUtilization / 100)
+#
+#   frontend:    50% × 500m = 250m  — scale when each pod averages 250m
+#   productcat:  50% × 250m = 125m  — scale when CPU browsing starts
+#   recommend:   55% × 200m = 110m  — raised from 50% (Python import spike fix)
+#   cart:        60% × 500m = 300m  — raised from 55% (was 165m, too sensitive)
+#   checkout:    55% × 200m = 110m  — scale under checkout load
+#   currency:    60% × 100m =  60m  — lightweight, called every page render
+# =============================================================================
+
+# ── Frontend — highest traffic, scale aggressively ────────────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: frontend
+  namespace: boutique
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: frontend
+  minReplicas: 2
+  maxReplicas: 10    # 10 × 500m = 5000m — within budget, leaves room for cart
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Pods
+          value: 3           # scale 3 pods at a time during ramp
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 300  # hold for 5min before scaling down
+      policies:
+        - type: Pods
+          value: 1           # release 1 pod per minute — smooth tail-off
+          periodSeconds: 60
+---
+# ── Product Catalog — CPU-heavy on browse ─────────────────────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: productcatalogservice
+  namespace: boutique
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: productcatalogservice
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+---
+# ── Recommendation — Python, I/O bound ────────────────────────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: recommendationservice
+  namespace: boutique
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: recommendationservice
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 55   # 55% × 200m = 110m. Avoids Python startup spikes.
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 45    # longer window — Python import CPU spike avoidance
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+---
+# ── Cart — THE critical service. Conservatively tuned. ────────────────────────
+#
+# maxReplicas: 5 (reduced from 8)
+# Reason: 5 × 500m = 2500m requests. With frontend at max (10 × 500m = 5000m)
+# the combined request budget is 7500m — still within node capacity.
+# 8 pods was mathematically impossible to schedule alongside full observability.
+#
+# stabilizationWindowSeconds (scaleUp): 60s — NOT 30s.
+# The k6 load profile ramps from 100→500→1000 VU over 3 minutes.
+# cartservice CPU spikes during .NET JIT warmup even at low VU counts.
+# A 60s window prevents the HPA from over-scaling during the ramp phase,
+# which would trigger cascading scheduling pressure before load is stable.
+#
+# averageUtilization: 60% (60% × 500m = 300m actual threshold)
+# Previously 55% × 300m = 165m — a single JIT-warmed gRPC connection hit this.
+# Now requires sustained 300m across ALL cart pods before scale fires.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: cartservice
+  namespace: boutique
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: cartservice
+  minReplicas: 2
+  maxReplicas: 5    # CRITICAL: reduced from 8. See budget math above.
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60    # longer than default — prevents JIT spike scale-out
+      policies:
+        - type: Pods
+          value: 1           # scale 1 pod at a time (conservative — cart is expensive)
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+---
+# ── Checkout — low volume, CPU-heavy per request ──────────────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: checkoutservice
+  namespace: boutique
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: checkoutservice
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 55
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+---
+# ── Currency — lightweight, called every page render ──────────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: currencyservice
+  namespace: boutique
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: currencyservice
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60

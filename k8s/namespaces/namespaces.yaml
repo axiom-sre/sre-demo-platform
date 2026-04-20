@@ -1,0 +1,75 @@
+# namespaces/namespaces.yaml
+# =============================================================================
+# Namespace definitions + ResourceQuotas for the SRE Demo Platform
+# =============================================================================
+#
+# ResourceQuota rationale for M5 Pro 64GB / 8 vCPU:
+#
+# Total node capacity: 8 CPU, ~60GB usable RAM (Docker Desktop reserves ~4GB)
+#
+# Budget allocation:
+#   boutique namespace:      16 CPU requests / 32 CPU limits
+#   observability namespace:  3 CPU requests / 12 CPU limits
+#   kube-system:             ~0.5 CPU reserved (metrics-server, coredns, etc.)
+#
+# WHY requests.cpu="16" NOT "6":
+#   The original "6" quota was the root cause of repeated load test failures.
+#   At ~8 minutes into a 100 VU test, HPA tries to scale cartservice/frontend.
+#   Each new pod needs 500m CPU request. With "6" as the hard ceiling and
+#   ~4050m already used at idle, only 1950m remained — blocking HPA from
+#   scheduling more than 3-4 additional pods. The pods stayed overloaded,
+#   cartservice hit its CPU *limit* (1000m or 1500m), got throttled to 100%,
+#   and the cascade: throttled cart → frontend goroutines pile up → all
+#   requests timeout → app appears completely dead.
+#
+#   requests.cpu="16" gives HPA full room to scale all services to max
+#   simultaneously without hitting the scheduler wall.
+#   limits.cpu="32" is the safety net preventing true node saturation.
+#
+# Memory: generous, M5 Pro has 64GB — memory is not the constraint here.
+# =============================================================================
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: boutique
+  labels:
+    name: boutique
+    platform: sre-demo
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: boutique-quota
+  namespace: boutique
+spec:
+  hard:
+    # requests.cpu=16: allows all HPAs to scale to max simultaneously
+    # limits.cpu=32:   safety net against true node saturation
+    requests.cpu: "16"
+    limits.cpu: "32"
+    requests.memory: "20Gi"
+    limits.memory: "40Gi"
+    # Pod count: prevents runaway HPA from infinite pod scheduling
+    pods: "60"
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: observability
+  labels:
+    name: observability
+    platform: sre-demo
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: observability-quota
+  namespace: observability
+spec:
+  hard:
+    requests.cpu: "3"
+    limits.cpu: "12"    # Prometheus + Alloy peak during compaction can hit 4-5 CPU
+    requests.memory: "4Gi"
+    limits.memory: "12Gi"
+    pods: "20"

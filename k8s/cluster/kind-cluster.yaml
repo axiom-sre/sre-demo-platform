@@ -1,0 +1,50 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: finflow
+
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+    extraPortMappings:
+      # Grafana
+      - containerPort: 30300
+        hostPort: 3000
+        protocol: TCP
+      # Online Boutique frontend
+      - containerPort: 30080
+        hostPort: 8080
+        protocol: TCP
+      # Prometheus
+      - containerPort: 30900
+        hostPort: 9090
+        protocol: TCP
+      # Loki
+      - containerPort: 30310
+        hostPort: 3100
+        protocol: TCP
+
+  - role: worker
+    kubeadmConfigPatches:
+      - |
+        kind: JoinConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "workload=boutique"
+
+  - role: worker
+    kubeadmConfigPatches:
+      - |
+        kind: JoinConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "workload=monitoring"
+
+# Networking
+networking:
+  podSubnet: "10.244.0.0/16"
+  serviceSubnet: "10.96.0.0/16"

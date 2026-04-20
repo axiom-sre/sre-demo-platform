@@ -1,0 +1,405 @@
+# observability/alloy/alloy.yaml — Holy Grail Edition (River syntax fixed)
+# =============================================================================
+# CRITICAL FIX — River config language syntax:
+#
+# River (Alloy's config DSL) does NOT support semicolons or single-line
+# attribute blocks. Every attribute inside a block { } must be on its own line.
+#
+# These were ALL illegal in the previous version and caused the errors:
+#   config.alloy:35:35  illegal character U+003B ';'
+#   config.alloy:36:40  illegal character U+003B ';'
+#   config.alloy:37:36  illegal character U+003B ';'
+#   config.alloy:118:57 illegal character U+003B ';'  (inline rule blocks)
+#   config.alloy:174:1  expected }, got EOF           (cascade from above)
+#
+#   ILLEGAL:  grpc { endpoint = "0.0.0.0:4317" }
+#   ILLEGAL:  tls  { insecure = true }
+#   ILLEGAL:  rule { source_labels = [...]; target_label = "namespace" }
+#   ILLEGAL:  dimension { name = "http.method"; default = "GET" }
+#
+#   LEGAL:    grpc {
+#               endpoint = "0.0.0.0:4317"
+#             }
+#
+# Every block in config.alloy below is fully expanded to multi-line.
+# Zero inline attribute blocks. Zero semicolons.
+# =============================================================================
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: alloy
+  namespace: observability
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: alloy
+rules:
+  - apiGroups: [""]
+    resources: [nodes, nodes/proxy, nodes/metrics, services, endpoints, pods, namespaces]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get]
+  - nonResourceURLs: [/metrics, /metrics/cadvisor]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: alloy
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: alloy
+subjects:
+  - kind: ServiceAccount
+    name: alloy
+    namespace: observability
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alloy-config
+  namespace: observability
+data:
+  config.alloy: |
+    // =========================================================================
+    // PIPELINE A — TRACES (OTLP in → batch → spanmetrics + tempo)
+    // =========================================================================
+
+    otelcol.receiver.otlp "default" {
+      grpc {
+        endpoint = "0.0.0.0:4317"
+      }
+      http {
+        endpoint = "0.0.0.0:4318"
+      }
+      output {
+        traces = [otelcol.processor.batch.traces.input]
+      }
+    }
+
+    otelcol.processor.batch "traces" {
+      send_batch_size     = 4096
+      send_batch_max_size = 16384
+      timeout             = "2s"
+      output {
+        traces = [
+          otelcol.connector.spanmetrics.default.input,
+          otelcol.exporter.otlp.tempo.input,
+        ]
+      }
+    }
+
+    otelcol.connector.spanmetrics "default" {
+      histogram {
+        explicit {
+          buckets = ["5ms", "10ms", "20ms", "50ms", "100ms", "200ms", "400ms", "800ms", "1500ms", "3s", "5s"]
+        }
+      }
+      namespace = "traces"
+
+      dimension {
+        name    = "http.method"
+        default = "GET"
+      }
+      dimension {
+        name    = "http.status_code"
+        default = "unknown"
+      }
+      dimension {
+        name    = "service.name"
+        default = "unknown"
+      }
+
+      output {
+        metrics = [otelcol.exporter.prometheus.default.input]
+      }
+    }
+
+    otelcol.exporter.prometheus "default" {
+      resource_to_telemetry_conversion = true
+      forward_to = [prometheus.remote_write.spanmetrics.receiver]
+    }
+
+    prometheus.remote_write "spanmetrics" {
+      endpoint {
+        url = "http://prometheus.observability.svc.cluster.local:9090/api/v1/write"
+        queue_config {
+          capacity             = 200000
+          max_samples_per_send = 10000
+          max_shards           = 32
+          min_shards           = 8
+          batch_send_deadline  = "10s"
+        }
+        metadata_config {
+          send          = true
+          send_interval = "1m"
+        }
+      }
+    }
+
+    otelcol.exporter.otlp "tempo" {
+      client {
+        endpoint       = "tempo.observability.svc.cluster.local:4317"
+        tls {
+          insecure = true
+        }
+        wait_for_ready = true
+      }
+      retry_on_failure {
+        enabled          = true
+        initial_interval = "2s"
+        max_interval     = "30s"
+        max_elapsed_time = "120s"
+      }
+      sending_queue {
+        enabled       = true
+        num_consumers = 8
+        queue_size    = 8000
+      }
+    }
+
+    // =========================================================================
+    // PIPELINE B — LOGS (tail /var/log/pods → Loki)
+    // =========================================================================
+
+    discovery.kubernetes "pods" {
+      role = "pod"
+      selectors {
+        role  = "pod"
+        field = "spec.nodeName=" + sys.env("ALLOY_NODE_NAME")
+      }
+    }
+
+    discovery.relabel "pod_logs" {
+      targets = discovery.kubernetes.pods.targets
+
+      rule {
+        source_labels = ["__meta_kubernetes_pod_phase"]
+        regex         = "Pending|Succeeded|Failed|Unknown"
+        action        = "drop"
+      }
+
+      rule {
+        source_labels = ["__meta_kubernetes_pod_label_app"]
+        regex         = "alloy"
+        action        = "drop"
+      }
+
+      rule {
+        source_labels = ["__meta_kubernetes_namespace"]
+        target_label  = "namespace"
+      }
+
+      rule {
+        source_labels = ["__meta_kubernetes_pod_name"]
+        target_label  = "pod"
+      }
+
+      rule {
+        source_labels = ["__meta_kubernetes_pod_container_name"]
+        target_label  = "container"
+      }
+
+      rule {
+        source_labels = ["__meta_kubernetes_pod_label_app"]
+        target_label  = "app"
+      }
+
+      rule {
+        source_labels = ["__meta_kubernetes_namespace"]
+        target_label  = "env"
+        replacement   = "sre-demo"
+      }
+
+      rule {
+        source_labels = [
+          "__meta_kubernetes_namespace",
+          "__meta_kubernetes_pod_name",
+          "__meta_kubernetes_pod_uid",
+          "__meta_kubernetes_pod_container_name",
+        ]
+        separator    = "/"
+        regex        = "(.+)/(.+)/(.+)/(.+)"
+        replacement  = "/var/log/pods/$1_$2_$3/$4/*.log"
+        target_label = "__path__"
+      }
+    }
+
+    loki.source.file "pod_logs" {
+      targets    = discovery.relabel.pod_logs.output
+      forward_to = [loki.process.pod_logs.receiver]
+    }
+
+    loki.process "pod_logs" {
+      stage.cri {}
+
+      stage.drop {
+        expression          = "^ *$"
+        drop_counter_reason = "empty_line"
+      }
+
+      stage.static_labels {
+        values = {
+          cluster = "sre-demo",
+        }
+      }
+
+      forward_to = [loki.write.default.receiver]
+    }
+
+    loki.write "default" {
+      endpoint {
+        url = "http://loki.observability.svc.cluster.local:3100/loki/api/v1/push"
+      }
+      external_labels = {
+        cluster = "sre-demo",
+      }
+    }
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: alloy
+  namespace: observability
+  labels:
+    app: alloy
+spec:
+  selector:
+    matchLabels:
+      app: alloy
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: alloy
+      annotations:
+        checksum/config: "v5-river-syntax-fixed"
+    spec:
+      serviceAccountName: alloy
+      priorityClassName: system-node-critical
+      tolerations:
+        - operator: Exists
+      hostPID: false
+      hostNetwork: false
+      containers:
+        - name: alloy
+          image: grafana/alloy:v1.8.0
+          args:
+            - run
+            - /etc/alloy/config.alloy
+            - --server.http.listen-addr=0.0.0.0:12345
+            - --storage.path=/var/lib/alloy/data
+            - --stability.level=experimental
+            - --cluster.enabled=false
+          env:
+            - name: ALLOY_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: GOMEMLIMIT
+              value: "1395864371"
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+              protocol: TCP
+            - name: otlp-http
+              containerPort: 4318
+              protocol: TCP
+            - name: http
+              containerPort: 12345
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: 12345
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 6
+            successThreshold: 1
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /-/ready
+              port: 12345
+            initialDelaySeconds: 90
+            periodSeconds: 30
+            failureThreshold: 10
+            timeoutSeconds: 10
+          startupProbe:
+            httpGet:
+              path: /-/ready
+              port: 12345
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 30
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: config
+              mountPath: /etc/alloy
+            - name: data
+              mountPath: /var/lib/alloy/data
+            - name: varlogpods
+              mountPath: /var/log/pods
+              readOnly: true
+            - name: varlogcontainers
+              mountPath: /var/log/containers
+              readOnly: true
+            - name: varlibdocker
+              mountPath: /var/lib/docker/containers
+              readOnly: true
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: 2000m
+              memory: 1536Mi
+      volumes:
+        - name: config
+          configMap:
+            name: alloy-config
+        - name: data
+          emptyDir: {}
+        - name: varlogpods
+          hostPath:
+            path: /var/log/pods
+            type: DirectoryOrCreate
+        - name: varlogcontainers
+          hostPath:
+            path: /var/log/containers
+            type: DirectoryOrCreate
+        - name: varlibdocker
+          hostPath:
+            path: /var/lib/docker/containers
+            type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alloy
+  namespace: observability
+  labels:
+    app: alloy
+spec:
+  selector:
+    app: alloy
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+      protocol: TCP
+    - name: otlp-http
+      port: 4318
+      targetPort: 4318
+      protocol: TCP
+    - name: http
+      port: 12345
+      targetPort: 12345
+      protocol: TCP

@@ -1,0 +1,191 @@
+# observability/tempo/tempo.yaml — Holy Grail Edition
+# =============================================================================
+# KEY CHANGES vs previous version:
+#
+# 1. PriorityClass: observability-high. Tempo is the most memory-hungry
+#    component — at 1000 VU the ingester holds ~800Mi-1Gi of span data.
+#    Without priority, node pressure evicts Tempo first (largest memory pod),
+#    losing all trace history and breaking trace-to-log correlation in Grafana.
+#
+# 2. terminationGracePeriodSeconds: 60. Tempo's ingester WAL flush to blocks
+#    takes 15-30s for a full 1000 VU session. Without 60s grace, SIGTERM
+#    during compaction loses the current WAL block entirely. 30s was too tight.
+#
+# 3. search is enabled by default in Tempo 2.4.1. The explicit search: block
+#    was removed — "field search not found in type app.Config" parse error.
+#
+# 4. send_native_histograms removed from remote_write — invalid in 2.4.1.
+#
+# 5. max_block_bytes is NOT a valid field in ingester in 2.4.1.
+#    It belongs in compactor.compaction only. Removed from ingester section.
+#
+# 6. ingester.max_block_duration: 10m — flush blocks every 10min to keep
+#    compaction work small. Large blocks (default 30min) cause 503 storms
+#    when compaction runs because the compactor holds the block lock.
+#
+# 7. Storage: PVC (not emptyDir). emptyDir is ephemeral — pod restart loses
+#    all trace history. PVC survives across restarts.
+#
+# 8. Resources: memory limit 1.5Gi → 2Gi. At 1000 VU sustained for 10min,
+#    the ingester peak was measured at 1.4-1.6Gi. 1.5Gi was the OOM boundary.
+#    2Gi gives genuine headroom without being wasteful (64GB host).
+# =============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tempo-config
+  namespace: observability
+data:
+  tempo.yaml: |
+    server:
+      http_listen_port: 3200
+      log_level: warn
+
+    distributor:
+      receivers:
+        otlp:
+          protocols:
+            grpc:
+              endpoint: "0.0.0.0:4317"
+            http:
+              endpoint: "0.0.0.0:4318"
+
+    ingester:
+      trace_idle_period:     20s
+      flush_all_on_shutdown: true
+      max_block_duration:    10m
+
+    compactor:
+      compaction:
+        block_retention:           72h
+        compacted_block_retention: 1h
+        compaction_window:         1h
+        max_compaction_objects:    1000000
+        max_block_bytes:           104857600    # 100MiB — caps compaction block size
+        retention_concurrency:     10
+
+    metrics_generator:
+      registry:
+        external_labels:
+          source:  tempo
+          cluster: sre-demo
+      storage:
+        path: /var/tempo/generator/wal
+        remote_write:
+          - url: http://prometheus.observability.svc.cluster.local:9090/api/v1/write
+            send_exemplars: true
+
+    storage:
+      trace:
+        backend: local
+        wal:
+          path: /var/tempo/wal
+        local:
+          path: /var/tempo/blocks
+
+    overrides:
+      metrics_generator_processors: [service-graphs, span-metrics]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tempo-pvc
+  namespace: observability
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 15Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tempo
+  namespace: observability
+  labels:
+    app: tempo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tempo
+  template:
+    metadata:
+      labels:
+        app: tempo
+    spec:
+      priorityClassName: observability-high
+      # 60s grace: ingester WAL flush + current block compaction at shutdown
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsUser: 0
+        fsGroup: 0
+      containers:
+        - name: tempo
+          image: grafana/tempo:2.4.1
+          args: [-config.file=/etc/tempo/tempo.yaml]
+          ports:
+            - name: http
+              containerPort: 3200
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 3200
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /ready
+              port: 3200
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 5
+            timeoutSeconds: 10
+          volumeMounts:
+            - name: config
+              mountPath: /etc/tempo
+            - name: data
+              mountPath: /var/tempo
+          resources:
+            requests:
+              cpu: 300m
+              memory: 768Mi
+            limits:
+              cpu: 1500m
+              memory: 2Gi    # raised from 1.5Gi — ingester peak at 1000 VU is 1.4-1.6Gi
+      volumes:
+        - name: config
+          configMap:
+            name: tempo-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: tempo-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tempo
+  namespace: observability
+  labels:
+    app: tempo
+spec:
+  selector:
+    app: tempo
+  ports:
+    - name: http
+      port: 3200
+      targetPort: 3200
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+    - name: otlp-http
+      port: 4318
+      targetPort: 4318

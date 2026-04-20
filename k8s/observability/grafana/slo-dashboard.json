@@ -1,0 +1,345 @@
+{
+  "title": "Boutique — SLI / SLO / Error Budget",
+  "uid": "boutique-slo",
+  "tags": ["boutique", "slo", "error-budget"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "title": "📋 SLO Status — p90 Latency Compliance (5m window)",
+      "description": "SLO: p90 latency < 500ms for all services, < 1000ms for frontend. Green = meeting SLO.",
+      "type": "stat",
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 5 },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "orientation": "horizontal",
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "range", "options": { "from": 0, "to": 0.999, "result": { "text": "✅ MEETING SLO", "color": "green" } } },
+            { "type": "range", "options": { "from": 1, "to": 99999, "result": { "text": "🔴 SLO BREACH", "color": "red" } } }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": { "uid": "prometheus" },
+          "expr": "histogram_quantile(0.90, sum by (le, service) (rate(traces_spanmetrics_latency_bucket[5m]))) > 500 unless on(service) (histogram_quantile(0.90, sum by (le, service) (rate(traces_spanmetrics_latency_bucket[5m]))) < 1)",
+          "legendFormat": "BREACH: {{service}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "📊 SLI — p90 Latency vs SLO Threshold (All Services)",
+      "description": "Red dashed line = 500ms SLO. Orange = 1000ms frontend SLO.",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 5, "w": 24, "h": 10 },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line", "lineInterpolation": "smooth", "lineWidth": 2,
+            "fillOpacity": 5, "gradientMode": "hue", "showPoints": "auto",
+            "spanNulls": false, "axisBorderShow": false, "barAlignment": 0,
+            "insertNulls": false, "pointSize": 3,
+            "scaleDistribution": { "type": "linear" },
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "dashed+area" }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 400 },
+              { "color": "red", "value": 500 }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "SLO: General (500ms)" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } },
+              { "id": "custom.lineWidth", "value": 2 },
+              { "id": "custom.lineStyle", "value": { "dash": [8, 4], "fill": "dash" } },
+              { "id": "custom.fillOpacity", "value": 0 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "SLO: Frontend (1000ms)" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } },
+              { "id": "custom.lineWidth", "value": 2 },
+              { "id": "custom.lineStyle", "value": { "dash": [8, 4], "fill": "dash" } },
+              { "id": "custom.fillOpacity", "value": 0 }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "uid": "prometheus" },
+          "expr": "histogram_quantile(0.90, sum by (le, service) (rate(traces_spanmetrics_latency_bucket[5m])))",
+          "legendFormat": "{{service}}",
+          "refId": "A"
+        },
+        {
+          "datasource": { "uid": "prometheus" },
+          "expr": "vector(500)",
+          "legendFormat": "SLO: General (500ms)",
+          "refId": "B"
+        },
+        {
+          "datasource": { "uid": "prometheus" },
+          "expr": "vector(1000)",
+          "legendFormat": "SLO: Frontend (1000ms)",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "🟢 SLO Compliance % — p90 < 500ms (1h rolling)",
+      "description": "% of 5-minute windows in the last hour where p90 latency was under SLO. 100% = perfect.",
+      "type": "gauge",
+      "gridPos": { "x": 0, "y": 15, "w": 8, "h": 8 },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "orientation": "auto",
+        "showThresholdLabels": true,
+        "showThresholdMarkers": true,
+        "minVizHeight": 75,
+        "minVizWidth": 75
+      },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0, "max": 100,
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 95 },
+              { "color": "green", "value": 99 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": { "uid": "prometheus" },
+          "expr": "100 * (1 - (sum(rate(traces_spanmetrics_latency_bucket{le=\"500\"}[1h])) / sum(rate(traces_spanmetrics_latency_count[1h]))))",
+          "legendFormat": "SLO Compliance %",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "🟡 Frontend SLO Compliance % — p90 < 1000ms (1h rolling)",
+      "type": "gauge",
+      "gridPos": { "x": 8, "y": 15, "w": 8, "h": 8 },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "orientation": "auto",
+        "showThresholdLabels": true,
+        "showThresholdMarkers": true
+      },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0, "max": 100,
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 95 },
+              { "color": "green", "value": 99 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": { "uid": "prometheus" },
+          "expr": "100 * sum(rate(traces_spanmetrics_latency_bucket{le=\"1000\", service=\"frontend\"}[1h])) / sum(rate(traces_spanmetrics_latency_count{service=\"frontend\"}[1h]))",
+          "legendFormat": "Frontend SLO %",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "💰 Error Budget Remaining — Latency (30d, 99.5% SLO)",
+      "description": "Error budget = total allowed SLO violations. 99.5% SLO = 0.5% allowed violations = 3.6h/month. Shows % of budget remaining.",
+      "type": "gauge",
+      "gridPos": { "x": 16, "y": 15, "w": 8, "h": 8 },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "orientation": "auto",
+        "showThresholdLabels": true,
+        "showThresholdMarkers": true
+      },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0, "max": 100,
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 25 },
+              { "color": "green", "value": 50 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": { "uid": "prometheus" },
+          "expr": "100 * (1 - ((1 - sum(rate(traces_spanmetrics_latency_bucket{le=\"500\"}[1h])) / sum(rate(traces_spanmetrics_latency_count[1h]))) / 0.005))",
+          "legendFormat": "Budget Remaining %",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "📉 Error Budget Burn Rate (1h vs 5m) — Alert if >1",
+      "description": "Burn rate >1 means budget depleting faster than it accrues. >3 = fast burn alert. >14 = critical.",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 23, "w": 24, "h": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line", "lineInterpolation": "smooth", "lineWidth": 2,
+            "fillOpacity": 10, "gradientMode": "opacity", "showPoints": "auto",
+            "spanNulls": false, "axisBorderShow": false, "barAlignment": 0,
+            "insertNulls": false, "pointSize": 3,
+            "scaleDistribution": { "type": "linear" },
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "dashed" }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "orange", "value": 3 },
+              { "color": "red", "value": 14 }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "uid": "prometheus" },
+          "expr": "(1 - sum(rate(traces_spanmetrics_latency_bucket{le=\"500\"}[1h])) / sum(rate(traces_spanmetrics_latency_count[1h]))) / 0.005",
+          "legendFormat": "Burn Rate (1h)",
+          "refId": "A"
+        },
+        {
+          "datasource": { "uid": "prometheus" },
+          "expr": "(1 - sum(rate(traces_spanmetrics_latency_bucket{le=\"500\"}[5m])) / sum(rate(traces_spanmetrics_latency_count[5m]))) / 0.005",
+          "legendFormat": "Burn Rate (5m)",
+          "refId": "B"
+        },
+        {
+          "datasource": { "uid": "prometheus" },
+          "expr": "vector(1)",
+          "legendFormat": "🔴 Burn Rate = 1 (budget depleting at rate)",
+          "refId": "C"
+        },
+        {
+          "datasource": { "uid": "prometheus" },
+          "expr": "vector(3)",
+          "legendFormat": "🚨 Fast Burn = 3",
+          "refId": "D"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "📊 p90 Latency Heatmap — All Services (5m buckets)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 31, "w": 24, "h": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line", "lineInterpolation": "smooth", "lineWidth": 2,
+            "fillOpacity": 8, "gradientMode": "hue", "showPoints": "never",
+            "spanNulls": false, "axisBorderShow": false, "barAlignment": 0,
+            "insertNulls": false, "pointSize": 3,
+            "scaleDistribution": { "type": "linear" },
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "dashed" }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 400 },
+              { "color": "red", "value": 500 }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "calcs": ["mean", "max", "lastNotNull"], "displayMode": "table", "placement": "right", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "uid": "prometheus" },
+          "expr": "histogram_quantile(0.50, sum by (le, service) (rate(traces_spanmetrics_latency_bucket[5m])))",
+          "legendFormat": "p50 {{service}}", "refId": "A"
+        },
+        {
+          "datasource": { "uid": "prometheus" },
+          "expr": "histogram_quantile(0.90, sum by (le, service) (rate(traces_spanmetrics_latency_bucket[5m])))",
+          "legendFormat": "p90 {{service}}", "refId": "B"
+        },
+        {
+          "datasource": { "uid": "prometheus" },
+          "expr": "histogram_quantile(0.99, sum by (le, service) (rate(traces_spanmetrics_latency_bucket[5m])))",
+          "legendFormat": "p99 {{service}}", "refId": "C"
+        }
+      ]
+    }
+  ],
+  "templating": { "list": [] },
+  "timepicker": {},
+  "weekStart": "",
+  "version": 1
+}

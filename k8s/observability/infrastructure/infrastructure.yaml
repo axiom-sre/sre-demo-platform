@@ -1,0 +1,358 @@
+# observability/infrastructure/infrastructure.yaml — Holy Grail Edition
+# =============================================================================
+# KEY CHANGES vs previous version:
+#
+# 1. PriorityClass: observability-high on kube-state-metrics.
+#    kube-state-metrics powers the HPA speedometer panels in Grafana and
+#    provides kube_horizontalpodautoscaler_* metrics that the demo relies on.
+#    Without priority, it can get evicted when boutique is scaling aggressively.
+#
+# 2. node-exporter: no PriorityClass needed (DaemonSet with Exists toleration
+#    already gets system-node-critical treatment on single-node clusters).
+#
+# 3. metrics-server: already in kube-system, inherits system priority.
+#    No changes needed — it's not in the observability namespace resource quota.
+#
+# All other values are unchanged from the previous version.
+# =============================================================================
+
+# ── Node Exporter ─────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-exporter
+  namespace: observability
+  labels:
+    app: node-exporter
+spec:
+  selector:
+    matchLabels:
+      app: node-exporter
+  template:
+    metadata:
+      labels:
+        app: node-exporter
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
+    spec:
+      hostPID: true
+      hostIPC: true
+      hostNetwork: true
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: node-exporter
+          image: prom/node-exporter:v1.7.0
+          args:
+            - --path.procfs=/host/proc
+            - --path.sysfs=/host/sys
+            - --path.rootfs=/host/root
+            - --collector.filesystem.ignored-mount-points=^/(dev|proc|sys|var/lib/docker/.+)($|/)
+            - --collector.filesystem.ignored-fs-types=^(autofs|binfmt_misc|cgroup|configfs|debugfs|devpts|devtmpfs|fusectl|hugetlbfs|mqueue|overlay|proc|procfs|pstore|rpc_pipefs|securityfs|sysfs|tracefs)$
+          ports:
+            - containerPort: 9100
+              hostPort: 9100
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          volumeMounts:
+            - name: proc
+              mountPath: /host/proc
+              readOnly: true
+            - name: sys
+              mountPath: /host/sys
+              readOnly: true
+            - name: root
+              mountPath: /host/root
+              readOnly: true
+              mountPropagation: HostToContainer
+      volumes:
+        - name: proc
+          hostPath: { path: /proc }
+        - name: sys
+          hostPath: { path: /sys }
+        - name: root
+          hostPath: { path: / }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-exporter
+  namespace: observability
+  labels:
+    app: node-exporter
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    - port: 9100
+      targetPort: 9100
+      name: metrics
+  selector:
+    app: node-exporter
+---
+# ── kube-state-metrics ────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kube-state-metrics
+  namespace: observability
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kube-state-metrics
+rules:
+  - apiGroups: [""]
+    resources: [configmaps, secrets, nodes, pods, services, resourcequotas, replicationcontrollers, limitranges, persistentvolumeclaims, persistentvolumes, namespaces, endpoints]
+    verbs: ["list", "watch"]
+  - apiGroups: ["apps"]
+    resources: [statefulsets, daemonsets, deployments, replicasets]
+    verbs: ["list", "watch"]
+  - apiGroups: ["autoscaling"]
+    resources: [horizontalpodautoscalers]
+    verbs: ["list", "watch"]
+  - apiGroups: ["batch"]
+    resources: [cronjobs, jobs]
+    verbs: ["list", "watch"]
+  - apiGroups: ["policy"]
+    resources: [poddisruptionbudgets]
+    verbs: ["list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: [storageclasses, volumeattachments]
+    verbs: ["list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: [ingresses, networkpolicies]
+    verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kube-state-metrics
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kube-state-metrics
+subjects:
+  - kind: ServiceAccount
+    name: kube-state-metrics
+    namespace: observability
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kube-state-metrics
+  namespace: observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kube-state-metrics
+  template:
+    metadata:
+      labels:
+        app: kube-state-metrics
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+    spec:
+      serviceAccountName: kube-state-metrics
+      priorityClassName: observability-high
+      containers:
+        - name: kube-state-metrics
+          image: registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.11.0
+          ports:
+            - name: http-metrics
+              containerPort: 8080
+            - name: telemetry
+              containerPort: 8081
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kube-state-metrics
+  namespace: observability
+  labels:
+    app: kube-state-metrics
+spec:
+  ports:
+    - name: http-metrics
+      port: 8080
+      targetPort: 8080
+    - name: telemetry
+      port: 8081
+      targetPort: 8081
+  selector:
+    app: kube-state-metrics
+---
+# ── Metrics Server ────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: metrics-server
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: system:aggregated-metrics-reader
+  labels:
+    rbac.authorization.k8s.io/aggregate-to-view: "true"
+    rbac.authorization.k8s.io/aggregate-to-edit: "true"
+    rbac.authorization.k8s.io/aggregate-to-admin: "true"
+rules:
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods", "nodes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: system:metrics-server
+rules:
+  - apiGroups: [""]
+    resources: ["nodes/metrics"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods", "nodes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: metrics-server:system:auth-delegator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: metrics-server
+    namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: metrics-server-auth-reader
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: extension-apiserver-authentication-reader
+subjects:
+  - kind: ServiceAccount
+    name: metrics-server
+    namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: system:metrics-server
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:metrics-server
+subjects:
+  - kind: ServiceAccount
+    name: metrics-server
+    namespace: kube-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metrics-server
+  namespace: kube-system
+  labels:
+    app: metrics-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: metrics-server
+  template:
+    metadata:
+      labels:
+        app: metrics-server
+    spec:
+      serviceAccountName: metrics-server
+      containers:
+        - name: metrics-server
+          image: registry.k8s.io/metrics-server/metrics-server:v0.7.1
+          args:
+            - --cert-dir=/tmp
+            - --secure-port=10250
+            - --kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname
+            - --kubelet-use-node-status-port
+            - --metric-resolution=15s
+            - --kubelet-insecure-tls
+          ports:
+            - name: https
+              containerPort: 10250
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: https
+              scheme: HTTPS
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          volumeMounts:
+            - name: tmp-dir
+              mountPath: /tmp
+      volumes:
+        - name: tmp-dir
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: metrics-server
+  namespace: kube-system
+  labels:
+    app: metrics-server
+spec:
+  ports:
+    - name: https
+      port: 443
+      targetPort: 10250
+  selector:
+    app: metrics-server
+---
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1beta1.metrics.k8s.io
+spec:
+  service:
+    name: metrics-server
+    namespace: kube-system
+    port: 443
+  group: metrics.k8s.io
+  version: v1beta1
+  insecureSkipTLSVerify: true
+  groupPriorityMinimum: 100
+  versionPriority: 100

@@ -1,0 +1,13 @@
+# config/prometheus.yaml
+# Minimal config — Alloy pushes all metrics via remote_write.
+# No scrape configs needed here.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+# No alerting rules needed for golden signals
+rule_files: []
+
+# No scrape jobs — Alloy handles all collection and remote_writes here
+scrape_configs: []

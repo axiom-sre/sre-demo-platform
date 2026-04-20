@@ -1,0 +1,42 @@
+---
+# .yamllint.yaml — YAML linting rules for sre-demo-platform
+#
+# Philosophy: catch real errors (duplicate keys, invalid structure),
+# allow our formatting style (long lines in comments, inline lists for ports).
+
+extends: default
+
+rules:
+  # Long comment blocks in YAML headers are intentional — don't fail on them
+  line-length:
+    max: 200
+    level: warning
+
+  # We use truthy values like 'true' and 'false' in Kubernetes specs
+  truthy:
+    allowed-values: ['true', 'false', 'yes', 'no']
+    check-keys: false
+
+  # Kubernetes manifests frequently use 2-space indent — enforce it
+  indentation:
+    spaces: 2
+    indent-sequences: true
+    check-multi-line-strings: false
+
+  # Allow multiple documents in a single file (--- separator)
+  document-start:
+    present: optional
+
+  # Comments are fine anywhere
+  comments:
+    min-spaces-from-content: 1
+
+  # Allow empty lines (common in config sections)
+  empty-lines:
+    max: 3
+    max-start: 0
+    max-end: 1
+
+ignore: |
+  k8s/charts/
+  docker/
