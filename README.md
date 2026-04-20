@@ -1,4 +1,4 @@
-# 🔱 SRE Demo Platform — Holy Grail Edition
+# SRE Demo Platform — Master Edition
 
 > A production-grade SRE learning platform running on Kubernetes (Docker Desktop), featuring the Google Online Boutique microservices app instrumented with a full LGTM observability stack, HPA, chaos readiness, and load testing harness.
 
@@ -117,7 +117,7 @@ bash scripts/manage.sh budget
 
 ---
 
-## 🔥 Load Testing
+## 🔨 Load Testing
 
 ```bash
 # Find the correct BASE_URL for your Docker Desktop config
