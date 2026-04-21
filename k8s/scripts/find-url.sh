@@ -1,10 +1,23 @@
 #!/usr/bin/env bash
 # =============================================================================
-# scripts/find-url.sh — Find the correct frontend URL on Docker Desktop
+# scripts/find-url.sh — Find the correct frontend URL v3
 # =============================================================================
-# Docker Desktop NodePort behaviour is inconsistent across versions.
-# This script finds whatever actually works and prints the correct BASE_URL
-# to use for k6 load tests.
+# Docker Desktop LoadBalancer → localhost:8080 is the primary reliable path.
+# NodePort :30080 is secondary — works on some Docker Desktop versions but
+# breaks after sleep/wake due to VM network namespace reset.
+#
+# KEY CHANGES vs v2:
+#
+# 1. Health check URL changed from / to /_healthz.
+#    The root path / renders the full boutique homepage (calls productcatalog,
+#    currency, ads — 5+ gRPC calls). During cold-start, / returns 500 even
+#    when the HTTP server is up. /_healthz is a lightweight internal check
+#    that only verifies the HTTP server, not backends — correct for URL discovery.
+#    Note: for smoke testing we still hit / to verify backends are ready.
+#
+# 2. HTTP 200 OR 302 both count as reachable.
+#    Some Docker Desktop versions add a redirect on first hit. 302 is fine.
+#    Previous version only accepted 200 — missed working endpoints on redirect.
 #
 # Usage:
 #   bash scripts/find-url.sh
@@ -33,38 +46,37 @@ if [[ "$pod_status" != "Running" ]]; then
 fi
 log "Frontend pod: Running ✓"
 
-# ── Step 2: Get auxiliary port info (for fallback candidates only) ────────────
+# ── Step 2: Get service info ──────────────────────────────────────────────────
 node_port=$(kubectl get svc frontend -n boutique \
   -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null || echo "")
 svc_type=$(kubectl get svc frontend -n boutique \
   -o jsonpath='{.spec.type}' 2>/dev/null || echo "unknown")
 log "Service type: ${svc_type}  nodePort: ${node_port:-none}"
 
-# ── Step 3: Try candidate URLs in order of preference ────────────────────────
-# Priority order for Docker Desktop on macOS:
-#   1. LoadBalancer port 8080 — Docker Desktop maps this to localhost natively ✓
-#   2. Port-forward on 8080   — always works when start.sh is running ✓
-#   3. NodePort localhost      — unreliable on Docker Desktop macOS
-#   4. Node internal IP        — works for kind, some Docker Desktop configs
+# ── Step 3: Try candidate URLs ────────────────────────────────────────────────
+# Priority order:
+#   1. LoadBalancer :8080 — Docker Desktop maps this natively to localhost ✓
+#   2. Port-forward :8080 — always works when start.sh is running ✓
+#   3. NodePort via localhost — unreliable on Docker Desktop macOS
+#   4. Node internal IP + NodePort — works for Kind, some Docker Desktop configs
 
 CANDIDATES=()
-
-# 1. LoadBalancer port 8080 — Docker Desktop maps this to localhost:8080 natively.
-#    This is the PREFERRED path (Docker Desktop LoadBalancer > NodePort).
 CANDIDATES+=("http://localhost:8080")
-
-# 2. NodePort via localhost (works on some Docker Desktop versions)
 [[ -n "$node_port" ]] && CANDIDATES+=("http://localhost:${node_port}")
 [[ -n "$node_port" ]] && CANDIDATES+=("http://127.0.0.1:${node_port}")
-
-# 3. Node internal IP + NodePort (kind clusters, some Docker Desktop configs)
-node_ip=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || echo "")
+node_ip=$(kubectl get nodes \
+  -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' \
+  2>/dev/null || echo "")
 [[ -n "$node_ip" && -n "$node_port" ]] && CANDIDATES+=("http://${node_ip}:${node_port}")
 
 WORKING_URL=""
 for url in "${CANDIDATES[@]}"; do
   log "Trying: $url ..."
-  http_code=$(curl -sf "$url/" -o /dev/null -w "%{http_code}" -m 5 2>/dev/null || echo "000")
+  # Use /_healthz (not /) — faster, works during backend cold-start
+  http_code=$(curl -sf "${url}/_healthz" -o /dev/null \
+    -w "%{http_code}" -m 5 \
+    -H "Cookie: shop_session-id=x-find-url" \
+    2>/dev/null || echo "000")
   if [[ "$http_code" == "200" || "$http_code" == "302" ]]; then
     log "✓ Reachable at $url (HTTP $http_code)"
     WORKING_URL="$url"
@@ -79,6 +91,7 @@ if [[ -z "$WORKING_URL" ]]; then
   err ""
   err "Likely causes:"
   err "  1. Frontend pod is starting up — wait 60s and retry"
+  err "     (minReadySeconds=30 means the pod waits 30s after readiness probe)"
   err "  2. Docker Desktop NodePort not bound — restart Docker Desktop"
   err "  3. Port-forward not running — run: bash scripts/start.sh --pf-only"
   err ""
@@ -102,11 +115,7 @@ else
   echo "  k6 run --env BASE_URL=$WORKING_URL scripts/load-test_100vusers.js"
   echo "  k6 run --env BASE_URL=$WORKING_URL scripts/load-test_1000vusers.js"
   echo ""
-
-  # ── Step 4: Confirm service type and routing ──────────────────────────────
   if [[ "$svc_type" == "LoadBalancer" ]]; then
     log "Service type: LoadBalancer ✓  (Docker Desktop routes this to localhost directly)"
-  elif [[ -n "$node_port" && "$WORKING_URL" == *"8080"* && "$WORKING_URL" != *"${node_port}"* ]]; then
-    log "Routing via port-forward on 8080 ✓  (LoadBalancer or port-forward active)"
   fi
 fi

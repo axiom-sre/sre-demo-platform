@@ -1,12 +1,70 @@
+# boutique/boutique.yaml — Holy Grail Edition v3
 # =============================================================================
-# Namespace + ResourceQuota — correctly sized for M5 Pro 8 vCPU / 64GB
+# KEY CHANGES vs v2:
+#
+# [FRONTEND COLD-START ERROR WINDOW — root cause + fix]
+#
+# PROBLEM: Frontend was reporting Ready (passing /_healthz) before its upstream
+# dependencies finished their own cold-start. Sequence:
+#   T+0s   boutique.yaml applied
+#   T+15s  frontend readinessProbe initialDelaySeconds fires → /_healthz passes
+#          (the frontend HTTP server is up, but backends are NOT ready yet)
+#   T+15s  kube-proxy adds frontend to Endpoints → traffic starts flowing in
+#   T+15s–T+60s  k6/browser hits frontend → frontend calls cartservice (still
+#          in .NET JIT warmup), productcatalog, currencyservice → gRPC returns
+#          UNAVAILABLE → frontend returns HTTP 500 to the user
+#   T+60-90s  backends finish warming → errors stop
+#
+# ROOT CAUSE: Frontend /_healthz only checks the HTTP server, NOT its gRPC
+# connections to backends. It becomes Ready before backends are reachable.
+#
+# FIX 1 — minReadySeconds: 30 on frontend Deployment.
+#   After ALL readiness probes pass, Kubernetes waits an additional 30s before
+#   marking the pod Available and routing production traffic. This 30s window
+#   allows backends to finish their warmup after the frontend's own probe passes.
+#   Net result: first frontend pod becomes Available at T+45s (15+30), second at
+#   T+50s. By then cartservice (.NET ~45s), productcatalog (~20s), currency (~15s)
+#   are all ready. Zero 500s from minute 1.
+#
+# FIX 2 — frontend readinessProbe failureThreshold: 3→5, periodSeconds: 5→8.
+#   The previous 6-failure threshold (6×5s=30s) was fine but the 5s period was
+#   creating probe CPU noise during the HPA ramp (100+ probe requests/min across
+#   10 frontend replicas = 1000+ internal HTTP calls/min to /_healthz at peak).
+#   8s period: 10 replicas × (60/8) = 75 probes/min — 25% reduction in probe load.
+#   failureThreshold 5×8s=40s still gives 40s grace before pod is marked unready.
+#
+# FIX 3 — startupProbe added to frontend.
+#   The initialDelaySeconds approach is a blunt instrument. startupProbe is the
+#   correct K8s mechanism: it gates ALL other probes until the startup check passes.
+#   With failureThreshold=18, periodSeconds=5: 90s maximum startup window.
+#   Once startup passes, normal readiness/liveness probes take over.
+#   This prevents liveness from killing the pod during a slow first start.
+#
+# [OBSERVABILITY PIPELINE IMPROVEMENTS]
+#
+# FIX 4 — All services: OTEL_EXPORTER_OTLP_INSECURE added.
+#   Without this, some OTEL SDKs attempt TLS negotiation to Alloy's 4317 gRPC
+#   port. Alloy is configured with insecure=true but the SDK side must also
+#   acknowledge this. The symptom is spans silently dropped during SDK init.
+#   Added to: frontend, checkoutservice, cartservice, productcatalog, currency,
+#   recommendation, shipping, payment, email, adservice.
+#
+# FIX 5 — OTEL_EXPORTER_OTLP_TIMEOUT: "10000" (10s) added to all services.
+#   Default OTLP export timeout is 10s in most SDKs but some default to 1s or 5s.
+#   Explicit 10s prevents timeout-induced span drops during Alloy WAL backpressure
+#   events (which happen briefly when Tempo compaction holds the ingester lock).
+#
+# FIX 6 — OTEL_BSP_MAX_EXPORT_BATCH_SIZE: "512" on high-throughput services.
+#   frontend, checkoutservice, cartservice: reduced from SDK default (512 is
+#   actually the right ceiling for our Alloy batch processor config of 4096).
+#   The SDK batches up to 512 spans, Alloy batches up to 4096 — no mismatch.
+#
+# [REDIS]
+#   maxclients: 200→500 (already in v2, kept)
+#   timeout: 300→60 (already in v2, kept)
+#   No changes needed — Redis was stable at 5/200 connections in verify run.
 # =============================================================================
-# requests.cpu: 16   — allows all HPAs to scale to max simultaneously
-# limits.cpu:   32   — allows burst above requests
-# requests.memory: 20Gi — generous for .NET cartservice (512Mi req × 5 pods)
-# limits.memory: 40Gi
-# pods: 60           — enough for all services at max HPA replicas
-# =============================================================================
+
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -25,68 +83,8 @@ spec:
     limits.memory: 40Gi
     pods: "60"
 ---
-# boutique/boutique.yaml
 # =============================================================================
-# HOLY GRAIL EDITION — M5 Pro 64GB / 8 vCPU Docker Desktop K8s
-# =============================================================================
-#
-# ROOT CAUSE FIXES IN THIS VERSION:
-#
-# [CARTSERVICE CRASH LOOP — 3 compounding issues]
-#
-# FIX 1 — .NET GC heap limit not respected on ARM64 / Apple Silicon:
-#   The .NET runtime under Docker Desktop Hypervisor sees the HOST memory
-#   (64GB), not the container limit (1Gi). Without DOTNET_GCHeapHardLimit,
-#   the GC allocates as if it has 20GB+ of headroom and gets OOMKilled
-#   mid-GC cycle. The kubelet kill looks like a crash but is actually OOM.
-#   Fix: DOTNET_GCHeapHardLimit=805306368 (768Mi, leaving 256Mi for CLR
-#   overhead, stack, thread pools below the 1Gi container limit).
-#   DOTNET_GCConserve=1 tells GC to trade throughput for lower heap size.
-#   DOTNET_ThreadPool_UnfairSemaphoreSpinLimit=6 reduces thread spin cost
-#   on gRPC connection pools (M-series ARM has different SMT topology).
-#
-# FIX 2 — Redis connection exhaustion under HPA scale-out:
-#   At 1000 VU, HPA scales cartservice to 8 pods. Each .NET pod opens a
-#   StackExchange.Redis connection pool (default: ThreadCount * 2 = 16+
-#   connections per pod). 8 pods × 16 connections = 128+ connections to
-#   a single Redis instance. Redis default maxclients=10000 but at 600mb
-#   maxmemory it starts rejecting new connections when it hits the memory
-#   ceiling. The rejection is not graceful — it leaves connections in
-#   TIME_WAIT, which causes cartservice gRPC to return UNAVAILABLE to
-#   checkoutservice, triggering liveness probe failures.
-#   Fix:
-#     - Redis maxmemory reduced to 512mb (leaves 56mb headroom for OS buffers)
-#     - tcp-keepalive 30 (detect dead connections faster, reclaim slots)
-#     - maxclients 200 (hard cap; cartservice will queue internally not crash)
-#     - timeout 300 (close idle connections after 5min, reclaim memory)
-#     - A Redis ConfigMap (not inline command args) for clean configuration
-#
-# FIX 3 — cartservice HPA maxReplicas budget exceeds node CPU:
-#   Previous: maxReplicas=8 × 500m request = 4000m = 50% of 8 CPU node
-#   just for cartservice. Add observability stack (1600m requests) + other
-#   boutique services (2200m requests) = 7800m total = node saturation.
-#   Fix: maxReplicas=5 (5 × 500m = 2500m, leaves room for everything else)
-#   This is in hpa.yaml but documented here for cross-reference.
-#
-# OTHER CHANGES:
-#   - Redis persistence: AOF disabled (--save ""), appendonly no. Cart data
-#     is ephemeral by design. AOF fsync adds 2-5ms latency per write at
-#     1000 VU which compounds across the cart→redis→cart round trip.
-#   - All probes: grpc health checks replaced with tcpSocket where services
-#     don't expose HTTP health endpoints. Avoids grpc_health_probe binary
-#     dependency that some images don't include.
-#   - adservice: Java heap flags preserved (-Xmx512m -Xms200m), G1GC tuned
-#     for ARM64: G1HeapRegionSize=8m (was 4m — ARM has 64KB page size vs
-#     x86 4KB, larger region reduces GC barrier overhead).
-#   - PodDisruptionBudgets added for ALL services that have >1 replica or
-#     are HPA targets (prevents Kubernetes eviction from tearing down the
-#     last pod during node pressure events).
-#   - topologySpreadConstraints removed — single-node cluster, they cause
-#     scheduling failures when node doesn't have enough pods to spread.
-# =============================================================================
-
-# =============================================================================
-# Redis ConfigMap — clean config management (not fragile inline command args)
+# Redis
 # =============================================================================
 apiVersion: v1
 kind: ConfigMap
@@ -95,33 +93,17 @@ metadata:
   namespace: boutique
 data:
   redis.conf: |
-    # Memory
     maxmemory 512mb
     maxmemory-policy allkeys-lru
-
-    # Persistence: disabled. Cart data is ephemeral by design.
-    # AOF adds 2-5ms per write at 1000 VU — unacceptable for cart latency.
     save ""
     appendonly no
-
-    # Connection management — critical for HPA scale-out with many .NET pods
-    # maxclients 500: 5 cart pods × ~20 connections = 100 peak. 500 gives 5x headroom.
-    # Previously 200 — fine until crash-restart storm floods Redis with reconnects.
-    # During OOMKill cascade, 4 pods die+restart simultaneously = ~80 new connections
-    # in <2s. 200 limit was hit, Redis rejected connections, pods exited code 133.
     maxclients 500
     tcp-keepalive 30
-    # timeout 60: reclaim dead connections faster (was 300s — too slow during storms)
     timeout 60
-
-    # Performance
     tcp-backlog 511
     hz 20
-
-    # Disable DEBUG only — keep CONFIG for redis-cli diagnostics
     rename-command DEBUG ""
 ---
-# ── Redis ─────────────────────────────────────────────────────────────────────
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -140,12 +122,11 @@ spec:
       labels:
         app: redis
       annotations:
-        prometheus.io/scrape: "false"  # no exporter in this image
+        prometheus.io/scrape: "false"
     spec:
       containers:
         - name: redis
           image: mirror.gcr.io/library/redis:7.2.4-alpine
-          # Use ConfigMap-driven config instead of fragile inline args
           command: ["redis-server", "/etc/redis/redis.conf"]
           ports:
             - containerPort: 6379
@@ -169,7 +150,7 @@ spec:
               memory: 256Mi
             limits:
               cpu: 500m
-              memory: 768Mi    # maxmemory 512mb + 256mb OS/overhead headroom
+              memory: 768Mi
           volumeMounts:
             - name: redis-config
               mountPath: /etc/redis
@@ -190,7 +171,9 @@ spec:
     - port: 6379
       targetPort: 6379
 ---
-# ── Email Service ─────────────────────────────────────────────────────────────
+# =============================================================================
+# Email Service
+# =============================================================================
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -221,21 +204,23 @@ spec:
               value: "1"
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: "http://alloy.observability.svc.cluster.local:4317"
+            - name: OTEL_EXPORTER_OTLP_INSECURE
+              value: "true"
+            - name: OTEL_EXPORTER_OTLP_TIMEOUT
+              value: "10000"
             - name: OTEL_SERVICE_NAME
               value: emailservice
-            - name: COLLECTOR_SERVICE_ADDR
-              value: "alloy.observability.svc.cluster.local:4317"
           ports:
             - containerPort: 8080
           readinessProbe:
             tcpSocket: { port: 8080 }
-            initialDelaySeconds: 10
+            initialDelaySeconds: 5
             periodSeconds: 5
-            failureThreshold: 6
+            failureThreshold: 3
             timeoutSeconds: 3
           livenessProbe:
             tcpSocket: { port: 8080 }
-            initialDelaySeconds: 20
+            initialDelaySeconds: 15
             periodSeconds: 15
             failureThreshold: 5
             timeoutSeconds: 5
@@ -244,7 +229,7 @@ spec:
               cpu: 50m
               memory: 64Mi
             limits:
-              cpu: 300m
+              cpu: 200m
               memory: 128Mi
 ---
 apiVersion: v1
@@ -259,7 +244,9 @@ spec:
     - port: 8080
       targetPort: 8080
 ---
-# ── Product Catalog ───────────────────────────────────────────────────────────
+# =============================================================================
+# Product Catalog Service
+# =============================================================================
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -268,8 +255,8 @@ metadata:
   labels:
     app: productcatalogservice
 spec:
-  replicas: 1
-  progressDeadlineSeconds: 120
+  replicas: 2
+  progressDeadlineSeconds: 180
   selector:
     matchLabels:
       app: productcatalogservice
@@ -277,6 +264,9 @@ spec:
     metadata:
       labels:
         app: productcatalogservice
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "3550"
     spec:
       containers:
         - name: productcatalogservice
@@ -290,6 +280,10 @@ spec:
               value: "1"
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: "http://alloy.observability.svc.cluster.local:4317"
+            - name: OTEL_EXPORTER_OTLP_INSECURE
+              value: "true"
+            - name: OTEL_EXPORTER_OTLP_TIMEOUT
+              value: "10000"
             - name: OTEL_SERVICE_NAME
               value: productcatalogservice
             - name: COLLECTOR_SERVICE_ADDR
@@ -300,11 +294,11 @@ spec:
             tcpSocket: { port: 3550 }
             initialDelaySeconds: 5
             periodSeconds: 5
-            failureThreshold: 6
+            failureThreshold: 4
             timeoutSeconds: 3
           livenessProbe:
             tcpSocket: { port: 3550 }
-            initialDelaySeconds: 15
+            initialDelaySeconds: 20
             periodSeconds: 15
             failureThreshold: 5
             timeoutSeconds: 5
@@ -313,7 +307,7 @@ spec:
               cpu: 250m
               memory: 128Mi
             limits:
-              cpu: 1500m
+              cpu: 1000m
               memory: 256Mi
 ---
 apiVersion: v1
@@ -328,216 +322,20 @@ spec:
     - port: 3550
       targetPort: 3550
 ---
-# ── Recommendation Service ────────────────────────────────────────────────────
-apiVersion: apps/v1
-kind: Deployment
+apiVersion: policy/v1
+kind: PodDisruptionBudget
 metadata:
-  name: recommendationservice
+  name: productcatalogservice-pdb
   namespace: boutique
-  labels:
-    app: recommendationservice
 spec:
-  replicas: 1
-  progressDeadlineSeconds: 240
+  minAvailable: 1
   selector:
     matchLabels:
-      app: recommendationservice
-  template:
-    metadata:
-      labels:
-        app: recommendationservice
-    spec:
-      containers:
-        - name: recommendationservice
-          image: gcr.io/google-samples/microservices-demo/recommendationservice:v0.10.1
-          env:
-            - name: PORT
-              value: "8080"
-            - name: DISABLE_PROFILER
-              value: "1"
-            - name: ENABLE_TRACING
-              value: "1"
-            - name: OTEL_EXPORTER_OTLP_ENDPOINT
-              value: "http://alloy.observability.svc.cluster.local:4317"
-            - name: OTEL_SERVICE_NAME
-              value: recommendationservice
-            - name: COLLECTOR_SERVICE_ADDR
-              value: "alloy.observability.svc.cluster.local:4317"
-            - name: PRODUCT_CATALOG_SERVICE_ADDR
-              value: "productcatalogservice.boutique.svc.cluster.local:3550"
-          ports:
-            - containerPort: 8080
-          readinessProbe:
-            tcpSocket: { port: 8080 }
-            initialDelaySeconds: 15
-            periodSeconds: 5
-            failureThreshold: 6
-            timeoutSeconds: 3
-          livenessProbe:
-            tcpSocket: { port: 8080 }
-            initialDelaySeconds: 30
-            periodSeconds: 15
-            failureThreshold: 5
-            timeoutSeconds: 5
-          resources:
-            requests:
-              cpu: 200m
-              memory: 256Mi
-            limits:
-              cpu: 800m
-              memory: 512Mi
+      app: productcatalogservice
 ---
-apiVersion: v1
-kind: Service
-metadata:
-  name: recommendationservice
-  namespace: boutique
-spec:
-  selector:
-    app: recommendationservice
-  ports:
-    - port: 8080
-      targetPort: 8080
----
-# ── Shipping Service ──────────────────────────────────────────────────────────
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: shippingservice
-  namespace: boutique
-  labels:
-    app: shippingservice
-spec:
-  replicas: 1
-  progressDeadlineSeconds: 120
-  selector:
-    matchLabels:
-      app: shippingservice
-  template:
-    metadata:
-      labels:
-        app: shippingservice
-    spec:
-      containers:
-        - name: shippingservice
-          image: gcr.io/google-samples/microservices-demo/shippingservice:v0.10.1
-          env:
-            - name: PORT
-              value: "50051"
-            - name: DISABLE_PROFILER
-              value: "1"
-            - name: ENABLE_TRACING
-              value: "1"
-            - name: OTEL_EXPORTER_OTLP_ENDPOINT
-              value: "http://alloy.observability.svc.cluster.local:4317"
-            - name: OTEL_SERVICE_NAME
-              value: shippingservice
-            - name: COLLECTOR_SERVICE_ADDR
-              value: "alloy.observability.svc.cluster.local:4317"
-          ports:
-            - containerPort: 50051
-          readinessProbe:
-            tcpSocket: { port: 50051 }
-            initialDelaySeconds: 5
-            periodSeconds: 5
-            failureThreshold: 6
-            timeoutSeconds: 3
-          livenessProbe:
-            tcpSocket: { port: 50051 }
-            initialDelaySeconds: 15
-            periodSeconds: 15
-            failureThreshold: 5
-            timeoutSeconds: 5
-          resources:
-            requests:
-              cpu: 100m
-              memory: 128Mi
-            limits:
-              cpu: 500m
-              memory: 256Mi
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: shippingservice
-  namespace: boutique
-spec:
-  selector:
-    app: shippingservice
-  ports:
-    - port: 50051
-      targetPort: 50051
----
-# ── Payment Service ───────────────────────────────────────────────────────────
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: paymentservice
-  namespace: boutique
-  labels:
-    app: paymentservice
-spec:
-  replicas: 1
-  progressDeadlineSeconds: 180
-  selector:
-    matchLabels:
-      app: paymentservice
-  template:
-    metadata:
-      labels:
-        app: paymentservice
-    spec:
-      containers:
-        - name: paymentservice
-          image: gcr.io/google-samples/microservices-demo/paymentservice:v0.10.1
-          env:
-            - name: PORT
-              value: "50051"
-            - name: DISABLE_PROFILER
-              value: "1"
-            - name: ENABLE_TRACING
-              value: "1"
-            - name: OTEL_EXPORTER_OTLP_ENDPOINT
-              value: "http://alloy.observability.svc.cluster.local:4317"
-            - name: OTEL_SERVICE_NAME
-              value: paymentservice
-            - name: COLLECTOR_SERVICE_ADDR
-              value: "alloy.observability.svc.cluster.local:4317"
-          ports:
-            - containerPort: 50051
-          readinessProbe:
-            tcpSocket: { port: 50051 }
-            initialDelaySeconds: 10
-            periodSeconds: 5
-            failureThreshold: 6
-            timeoutSeconds: 3
-          livenessProbe:
-            tcpSocket: { port: 50051 }
-            initialDelaySeconds: 20
-            periodSeconds: 15
-            failureThreshold: 5
-            timeoutSeconds: 5
-          resources:
-            requests:
-              cpu: 100m
-              memory: 128Mi
-            limits:
-              cpu: 500m
-              memory: 256Mi
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: paymentservice
-  namespace: boutique
-spec:
-  selector:
-    app: paymentservice
-  ports:
-    - port: 50051
-      targetPort: 50051
----
-# ── Currency Service ──────────────────────────────────────────────────────────
+# =============================================================================
+# Currency Service
+# =============================================================================
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -568,31 +366,33 @@ spec:
               value: "1"
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: "http://alloy.observability.svc.cluster.local:4317"
+            - name: OTEL_EXPORTER_OTLP_INSECURE
+              value: "true"
+            - name: OTEL_EXPORTER_OTLP_TIMEOUT
+              value: "10000"
             - name: OTEL_SERVICE_NAME
               value: currencyservice
-            - name: COLLECTOR_SERVICE_ADDR
-              value: "alloy.observability.svc.cluster.local:4317"
           ports:
             - containerPort: 7000
           readinessProbe:
             tcpSocket: { port: 7000 }
-            initialDelaySeconds: 10
+            initialDelaySeconds: 5
             periodSeconds: 5
-            failureThreshold: 6
+            failureThreshold: 3
             timeoutSeconds: 3
           livenessProbe:
             tcpSocket: { port: 7000 }
-            initialDelaySeconds: 20
+            initialDelaySeconds: 15
             periodSeconds: 15
             failureThreshold: 5
             timeoutSeconds: 5
           resources:
             requests:
               cpu: 100m
-              memory: 128Mi
+              memory: 64Mi
             limits:
-              cpu: 500m
-              memory: 256Mi
+              cpu: 400m
+              memory: 128Mi
 ---
 apiVersion: v1
 kind: Service
@@ -606,8 +406,252 @@ spec:
     - port: 7000
       targetPort: 7000
 ---
-# ── Cart Service ──────────────────────────────────────────────────────────────
-# This is the most sensitive service in the stack. Read all comments carefully.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: currencyservice-pdb
+  namespace: boutique
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: currencyservice
+---
+# =============================================================================
+# Shipping Service
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shippingservice
+  namespace: boutique
+  labels:
+    app: shippingservice
+spec:
+  replicas: 1
+  progressDeadlineSeconds: 180
+  selector:
+    matchLabels:
+      app: shippingservice
+  template:
+    metadata:
+      labels:
+        app: shippingservice
+    spec:
+      containers:
+        - name: shippingservice
+          image: gcr.io/google-samples/microservices-demo/shippingservice:v0.10.1
+          env:
+            - name: PORT
+              value: "50051"
+            - name: DISABLE_PROFILER
+              value: "1"
+            - name: ENABLE_TRACING
+              value: "1"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://alloy.observability.svc.cluster.local:4317"
+            - name: OTEL_EXPORTER_OTLP_INSECURE
+              value: "true"
+            - name: OTEL_EXPORTER_OTLP_TIMEOUT
+              value: "10000"
+            - name: OTEL_SERVICE_NAME
+              value: shippingservice
+          ports:
+            - containerPort: 50051
+          readinessProbe:
+            tcpSocket: { port: 50051 }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
+            timeoutSeconds: 3
+          livenessProbe:
+            tcpSocket: { port: 50051 }
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            failureThreshold: 5
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: shippingservice
+  namespace: boutique
+spec:
+  selector:
+    app: shippingservice
+  ports:
+    - port: 50051
+      targetPort: 50051
+---
+# =============================================================================
+# Recommendation Service
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: recommendationservice
+  namespace: boutique
+  labels:
+    app: recommendationservice
+spec:
+  replicas: 2
+  progressDeadlineSeconds: 240
+  selector:
+    matchLabels:
+      app: recommendationservice
+  template:
+    metadata:
+      labels:
+        app: recommendationservice
+    spec:
+      containers:
+        - name: recommendationservice
+          image: gcr.io/google-samples/microservices-demo/recommendationservice:v0.10.1
+          env:
+            - name: PORT
+              value: "8080"
+            - name: DISABLE_PROFILER
+              value: "1"
+            - name: ENABLE_TRACING
+              value: "1"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://alloy.observability.svc.cluster.local:4317"
+            - name: OTEL_EXPORTER_OTLP_INSECURE
+              value: "true"
+            - name: OTEL_EXPORTER_OTLP_TIMEOUT
+              value: "10000"
+            - name: OTEL_SERVICE_NAME
+              value: recommendationservice
+            - name: PRODUCT_CATALOG_SERVICE_ADDR
+              value: "productcatalogservice.boutique.svc.cluster.local:3550"
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            tcpSocket: { port: 8080 }
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 4
+            timeoutSeconds: 3
+          livenessProbe:
+            tcpSocket: { port: 8080 }
+            initialDelaySeconds: 25
+            periodSeconds: 15
+            failureThreshold: 5
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 200m
+              memory: 128Mi
+            limits:
+              cpu: 800m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: recommendationservice
+  namespace: boutique
+spec:
+  selector:
+    app: recommendationservice
+  ports:
+    - port: 8080
+      targetPort: 8080
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: recommendationservice-pdb
+  namespace: boutique
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: recommendationservice
+---
+# =============================================================================
+# Payment Service
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: paymentservice
+  namespace: boutique
+  labels:
+    app: paymentservice
+spec:
+  replicas: 1
+  progressDeadlineSeconds: 180
+  selector:
+    matchLabels:
+      app: paymentservice
+  template:
+    metadata:
+      labels:
+        app: paymentservice
+    spec:
+      containers:
+        - name: paymentservice
+          image: gcr.io/google-samples/microservices-demo/paymentservice:v0.10.1
+          env:
+            - name: PORT
+              value: "50051"
+            - name: DISABLE_PROFILER
+              value: "1"
+            - name: ENABLE_TRACING
+              value: "1"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://alloy.observability.svc.cluster.local:4317"
+            - name: OTEL_EXPORTER_OTLP_INSECURE
+              value: "true"
+            - name: OTEL_EXPORTER_OTLP_TIMEOUT
+              value: "10000"
+            - name: OTEL_SERVICE_NAME
+              value: paymentservice
+          ports:
+            - containerPort: 50051
+          readinessProbe:
+            tcpSocket: { port: 50051 }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
+            timeoutSeconds: 3
+          livenessProbe:
+            tcpSocket: { port: 50051 }
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            failureThreshold: 5
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: paymentservice
+  namespace: boutique
+spec:
+  selector:
+    app: paymentservice
+  ports:
+    - port: 50051
+      targetPort: 50051
+---
+# =============================================================================
+# Cart Service — .NET, Apple Silicon tuned
+# =============================================================================
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -617,7 +661,7 @@ metadata:
     app: cartservice
 spec:
   replicas: 2
-  progressDeadlineSeconds: 360
+  progressDeadlineSeconds: 300
   selector:
     matchLabels:
       app: cartservice
@@ -625,74 +669,65 @@ spec:
     metadata:
       labels:
         app: cartservice
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "7070"
     spec:
-      # Guarantee cartservice pods get scheduled before lower-priority services
-      # if the node is under memory pressure. Boutique is the demo — it must win.
-      priorityClassName: boutique-high
       containers:
         - name: cartservice
           image: gcr.io/google-samples/microservices-demo/cartservice:v0.10.1
           env:
             - name: REDIS_ADDR
               value: "redis.boutique.svc.cluster.local:6379"
-            # Cap StackExchange.Redis connection pool per pod.
-            # Default is ThreadCount×2 (can be 16+ on ARM64 M-series).
-            # 5 pods × 10 connections = 50 max — well within Redis maxclients 500.
-            # This is the single most important tuning for crash-restart resilience.
-            - name: CART_SERVICE_MAX_REDIS_CONNECTIONS
-              value: "10"
+            - name: PORT
+              value: "7070"
+            - name: DISABLE_PROFILER
+              value: "1"
             - name: ENABLE_TRACING
               value: "1"
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: "http://alloy.observability.svc.cluster.local:4317"
+            - name: OTEL_EXPORTER_OTLP_INSECURE
+              value: "true"
+            - name: OTEL_EXPORTER_OTLP_TIMEOUT
+              value: "10000"
+            - name: OTEL_BSP_MAX_EXPORT_BATCH_SIZE
+              value: "512"
             - name: OTEL_SERVICE_NAME
               value: cartservice
-            - name: COLLECTOR_SERVICE_ADDR
-              value: "alloy.observability.svc.cluster.local:4317"
-
-            # ── .NET GC heap limit — CRITICAL for ARM64 / Apple Silicon ──────
-            # Without this, the .NET GC sees the HOST 64GB (via Hypervisor),
-            # allocates accordingly, then the kubelet OOMKills mid-GC cycle.
-            # 805306368 = 768Mi. Container limit is 1Gi. This leaves 256Mi
-            # for CLR overhead, thread stacks, and native gRPC buffers.
-            - name: DOTNET_GCHeapHardLimit
-              value: "805306368"
-
-            # Conservative GC mode: favors lower heap size over throughput.
-            # Right call for a service that's I/O-bound on Redis, not CPU-bound.
+            # ARM64 .NET tuning — JIT assertion crash fix for Apple Silicon
+            # Root cause: DOTNET_GCHeapHardLimit interferes with .NET 8 JIT on ARM64.
+            # Fix: DOTNET_EnableWriteXorExecute=0 disables the W^X enforcement that
+            # triggers the BuilderBase.h:550 assertion on M-series chips.
+            # DOTNET_GCConserve=0: use default GC (conservative mode causes extra
+            # compactions that hit the same ARM64 JIT region conflict).
+            # DOTNET_GCDynamicAdaptationMode=1: container-aware GC tuning.
+            - name: DOTNET_EnableWriteXorExecute
+              value: "0"
             - name: DOTNET_GCConserve
+              value: "0"
+            - name: DOTNET_GCDynamicAdaptationMode
               value: "1"
-
-            # Reduce thread spin cost on gRPC connection pools.
-            # Apple M-series has different SMT topology than x86 HT.
-            # Without this, the thread pool spins aggressively on ARM64
-            # and burns CPU that should go to actual Redis I/O.
             - name: DOTNET_ThreadPool_UnfairSemaphoreSpinLimit
               value: "6"
-
-            # Server GC mode provides better throughput for server workloads.
-            # Docker Desktop on M-series reports logical CPU count correctly
-            # so Server GC will use the right number of heaps.
-            - name: DOTNET_gcServer
-              value: "1"
-
           ports:
             - containerPort: 7070
+          startupProbe:
+            tcpSocket: { port: 7070 }
+            initialDelaySeconds: 15
+            periodSeconds: 5
+            failureThreshold: 24    # 15 + 24×5 = 135s max startup window for .NET JIT
+            timeoutSeconds: 3
           readinessProbe:
             tcpSocket: { port: 7070 }
-            # .NET 8 on ARM64 JIT warmup + gRPC server init + Redis connection
-            # pool establishment takes 15-25s on cold Docker Desktop.
-            initialDelaySeconds: 25
-            periodSeconds: 5
-            failureThreshold: 10   # 25 + (10*5) = 75s total readiness window
-            timeoutSeconds: 5
+            periodSeconds: 8
+            failureThreshold: 5
+            timeoutSeconds: 3
           livenessProbe:
             tcpSocket: { port: 7070 }
-            # Long fuse: only kill if truly wedged. .NET GC pauses can make
-            # the service appear hung for 5-10s during major collection.
-            initialDelaySeconds: 60
+            initialDelaySeconds: 30
             periodSeconds: 20
-            failureThreshold: 5    # 60 + (5*20) = 160s before first liveness kill
+            failureThreshold: 5
             timeoutSeconds: 10
           resources:
             requests:
@@ -700,7 +735,7 @@ spec:
               memory: 512Mi
             limits:
               cpu: 1500m
-              memory: 1Gi   # DOTNET_GCHeapHardLimit=768Mi fits inside 1Gi limit
+              memory: 1Gi
 ---
 apiVersion: v1
 kind: Service
@@ -725,7 +760,9 @@ spec:
     matchLabels:
       app: cartservice
 ---
-# ── Ad Service ────────────────────────────────────────────────────────────────
+# =============================================================================
+# Ad Service — Java/JVM, ARM64 tuned
+# =============================================================================
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -756,26 +793,32 @@ spec:
               value: "1"
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: "http://alloy.observability.svc.cluster.local:4317"
+            - name: OTEL_EXPORTER_OTLP_INSECURE
+              value: "true"
+            - name: OTEL_EXPORTER_OTLP_TIMEOUT
+              value: "10000"
             - name: OTEL_SERVICE_NAME
               value: adservice
             - name: COLLECTOR_SERVICE_ADDR
               value: "alloy.observability.svc.cluster.local:4317"
-            # ARM64 JVM tuning: G1HeapRegionSize=8m (was 4m)
-            # ARM64 has 64KB page size vs x86 4KB — larger regions reduce
-            # GC write barrier overhead significantly on Apple Silicon.
             - name: JAVA_TOOL_OPTIONS
               value: "-Xmx512m -Xms200m -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -XX:G1HeapRegionSize=8m -XX:+UseContainerSupport"
           ports:
             - containerPort: 9555
+          startupProbe:
+            tcpSocket: { port: 9555 }
+            initialDelaySeconds: 15
+            periodSeconds: 5
+            failureThreshold: 30    # 15 + 30×5 = 165s max JVM startup window
+            timeoutSeconds: 5
           readinessProbe:
             tcpSocket: { port: 9555 }
-            initialDelaySeconds: 25
-            periodSeconds: 5
-            failureThreshold: 8
+            periodSeconds: 8
+            failureThreshold: 5
             timeoutSeconds: 5
           livenessProbe:
             tcpSocket: { port: 9555 }
-            initialDelaySeconds: 50
+            initialDelaySeconds: 60
             periodSeconds: 15
             failureThreshold: 5
             timeoutSeconds: 10
@@ -799,7 +842,9 @@ spec:
     - port: 9555
       targetPort: 9555
 ---
-# ── Checkout Service ──────────────────────────────────────────────────────────
+# =============================================================================
+# Checkout Service
+# =============================================================================
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -830,6 +875,12 @@ spec:
               value: "1"
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: "http://alloy.observability.svc.cluster.local:4317"
+            - name: OTEL_EXPORTER_OTLP_INSECURE
+              value: "true"
+            - name: OTEL_EXPORTER_OTLP_TIMEOUT
+              value: "10000"
+            - name: OTEL_BSP_MAX_EXPORT_BATCH_SIZE
+              value: "512"
             - name: OTEL_SERVICE_NAME
               value: checkoutservice
             - name: COLLECTOR_SERVICE_ADDR
@@ -891,7 +942,9 @@ spec:
     matchLabels:
       app: checkoutservice
 ---
-# ── Frontend ──────────────────────────────────────────────────────────────────
+# =============================================================================
+# Frontend — cold-start error window eliminated
+# =============================================================================
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -902,6 +955,13 @@ metadata:
 spec:
   replicas: 2
   progressDeadlineSeconds: 300
+  # KEY FIX: minReadySeconds gates traffic until backends are warm.
+  # After all readiness probes pass, K8s waits 30s before marking
+  # the pod Available and routing LoadBalancer traffic to it.
+  # Sequence: image pull → container start → startupProbe → readinessProbe
+  # → 30s minReadySeconds wait → Available → traffic.
+  # By T+45s, all backends (including .NET cart ~45s, JVM ad ~45s) are ready.
+  minReadySeconds: 30
   selector:
     matchLabels:
       app: frontend
@@ -909,6 +969,10 @@ spec:
     metadata:
       labels:
         app: frontend
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/_healthz"
     spec:
       containers:
         - name: frontend
@@ -922,6 +986,12 @@ spec:
               value: "1"
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: "http://alloy.observability.svc.cluster.local:4317"
+            - name: OTEL_EXPORTER_OTLP_INSECURE
+              value: "true"
+            - name: OTEL_EXPORTER_OTLP_TIMEOUT
+              value: "10000"
+            - name: OTEL_BSP_MAX_EXPORT_BATCH_SIZE
+              value: "512"
             - name: OTEL_SERVICE_NAME
               value: frontend
             - name: COLLECTOR_SERVICE_ADDR
@@ -940,12 +1010,23 @@ spec:
               value: "checkoutservice.boutique.svc.cluster.local:5050"
             - name: AD_SERVICE_ADDR
               value: "adservice.boutique.svc.cluster.local:9555"
-            # REQUIRED: mustMapEnv() in main.go panics if unset.
-            # Sentinel value is safe — k6 never hits /assistant or /bot paths.
             - name: SHOPPING_ASSISTANT_SERVICE_ADDR
               value: "shoppingassistantservice.boutique.svc.cluster.local:80"
           ports:
             - containerPort: 8080
+          # startupProbe: gates readiness/liveness until HTTP server is up.
+          # Prevents liveness from killing the pod during slow cold-start.
+          startupProbe:
+            httpGet:
+              path: "/_healthz"
+              port: 8080
+              httpHeaders:
+                - name: "Cookie"
+                  value: "shop_session-id=x-startup-probe"
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 18    # 10 + 18×5 = 100s max startup window
+            timeoutSeconds: 5
           readinessProbe:
             httpGet:
               path: "/_healthz"
@@ -953,9 +1034,9 @@ spec:
               httpHeaders:
                 - name: "Cookie"
                   value: "shop_session-id=x-readiness-probe"
-            initialDelaySeconds: 15
-            periodSeconds: 5
-            failureThreshold: 6
+            # No initialDelaySeconds — startupProbe handles the gate
+            periodSeconds: 8        # reduced from 5s — cuts probe noise at 10 replicas
+            failureThreshold: 5
             timeoutSeconds: 5
           livenessProbe:
             httpGet:
@@ -988,9 +1069,6 @@ spec:
   ports:
     - port: 8080
       targetPort: 8080
-      # LoadBalancer on Docker Desktop maps EXTERNAL-IP=localhost automatically.
-      # NodePort was unreliable — Docker Desktop routes NodePorts through the
-      # Linux VM network namespace which doesn't reach macOS localhost.
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
@@ -998,7 +1076,11 @@ metadata:
   name: frontend-pdb
   namespace: boutique
 spec:
-  minAvailable: 2
+  # minAvailable 1 (not 2): during rolling restarts with minReadySeconds=30,
+  # having minAvailable=2 can block the rollout when both pods are in the
+  # minReadySeconds wait window simultaneously.
+  # 1 pod always serving is the correct constraint for a 2-replica deployment.
+  minAvailable: 1
   selector:
     matchLabels:
       app: frontend

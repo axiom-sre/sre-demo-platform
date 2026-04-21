@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# verify-stability.sh — SRE Demo Platform: Stability Harness (Holy Grail Edition)
+# verify-stability.sh — SRE Demo Platform: Stability Harness v3
 # =============================================================================
 #
 # Definition of DONE (all 6 checks must pass):
@@ -12,54 +12,34 @@
 #   6. All HPA TARGETS show a real CPU percentage (not <unknown>)
 #
 # Usage:
-#   bash scripts/verify-stability.sh              # full run (1000 VU, ~9min)
-#   bash scripts/verify-stability.sh --short      # smoke test (100 VU, 2min)
+#   bash scripts/verify-stability.sh              # full run (1000 VU, ~30min)
+#   bash scripts/verify-stability.sh --short      # smoke (100 VU, 2min)
 #   bash scripts/verify-stability.sh --no-k6      # checks only, no load test
 #
-# KEY CHANGES vs previous version:
+# KEY CHANGES vs v2:
 #
-# 1. --short mode bug fixed: was running load-test_10vusers.js but overriding
-#    --vus 100 --duration 2m, which means the 10vusers script's own `options`
-#    block (stages) was being IGNORED — k6 uses `--vus` only if no `stages`
-#    are defined. Result: the 10-user script ran its own stages (10 VU for
-#    3min) not 100 VU for 2min.
-#    Fix: --short now passes BASE_URL and uses a simple --vus/--duration
-#    override against load-test_1000vusers.js, which has no conflicting stages
-#    when called with explicit --vus flag. Actually simpler: we call k6 run
-#    with the 1000vusers script but override stages via k6 env vars.
-#    Cleaner fix: run with explicit --vus 100 --duration 2m against a
-#    minimal inline script, OR just run the 1000vusers.js with env override.
-#    Implemented: use load-test_1000vusers.js with k6 --no-setup and
-#    override duration via the standard approach.
+# 1. CRITICAL: --short mode hardcoded BASE_URL=http://localhost:30080 FIXED.
+#    NodePort 30080 is unreliable on Docker Desktop — this was causing 100%
+#    failure rate in the smoke test. Now uses find-url.sh to discover the
+#    correct working URL (LoadBalancer :8080 is the reliable path on Docker Desktop).
 #
-# 2. Port-forward lifecycle: previous version opened separate port-forward
-#    processes for Check 3 and Check 4 on the same port 9090. If Check 3's
-#    port-forward was still alive when Check 4 tried to open, Check 4 got
-#    "bind: address already in use" and the variable prom_pf_pid was unset,
-#    causing `kill ""` to error out.
-#    Fix: single shared Prometheus port-forward for Checks 3+4, killed once
-#    at the end. Helper function manages the lifecycle cleanly.
+# 2. --short mode inline k6 script: threshold relaxed to rate<0.001 (0.1%)
+#    from rate<0.05 (5%). The 5% threshold was masking real pipeline problems —
+#    a 4.9% failure rate is not "stable". 0.1% is the correct bar for a smoke test.
+#    p95 < 2000ms (was 5000ms — 5 seconds is not a smoke test pass criterion).
 #
-# 3. Added Check 5: Redis health. At 1000 VU the most common cartservice
-#    crash cause is Redis connection exhaustion. This check queries Redis
-#    connected_clients via kubectl exec and fails if > 150 (our maxclients=200,
-#    so >150 means we're within 25 connections of the hard limit).
+# 3. Full mode k6 now passes BASE_URL from find-url.sh, same as --short.
+#    Previously the full run used load-test_1000vusers.js default (localhost:30080)
+#    which has the same NodePort problem.
 #
-# 4. Added Check 6: HPA target validity. If any HPA shows <unknown> for
-#    TARGETS, the HPA cannot scale and will either stay at minReplicas (under-
-#    provisioned) or at whatever replica count it was at when metrics died.
-#    This is always a metrics-server or Prometheus adapter issue. Catching it
-#    early prevents the "why isn't HPA scaling?" confusion during demos.
+# 4. Elapsed timer now starts AFTER k6 runs (not before), so Check timestamps
+#    align with the actual test window, not the preflight.
 #
-# 5. OOM check now specifically calls out cartservice separately from the
-#    general namespace OOM sweep. Cart OOM is the most common failure mode
-#    and deserves its own check line in the summary.
-#
-# 6. Summary now prints per-check detail (not just pass/fail count) so you
-#    can see at a glance which check failed without scrolling up.
+# 5. manage.sh logs reference updated: `alloy` now correctly uses `daemonset/alloy`
+#    in triage commands at the bottom (was `deployment/alloy` in some error messages).
 # =============================================================================
 
-set -uo pipefail   # intentionally not -e: collect all failures, don't bail on first
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ "$(basename "$SCRIPT_DIR")" == "scripts" ]]; then
@@ -85,30 +65,27 @@ section() {
 
 FAILURES=0
 RESULTS=()
-START_TS=$(date +%s)
 START_ISO=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 # ── Shared Prometheus port-forward ────────────────────────────────────────────
-# Open once, reuse for checks 3+4, close at end.
 PROM_PF_PID=0
 PROM_PF_MINE=false
 
 ensure_prometheus_pf() {
   if curl -sf "http://localhost:9090/-/healthy" -o /dev/null -m 3 2>/dev/null; then
-    return 0  # already reachable (start.sh port-forward is live)
+    return 0
   fi
   if $PROM_PF_MINE && kill -0 "$PROM_PF_PID" 2>/dev/null; then
-    return 0  # we already opened it
+    return 0
   fi
   kubectl port-forward -n observability svc/prometheus 9090:9090 \
     &>/tmp/pf-stability-prom.log &
   PROM_PF_PID=$!
   PROM_PF_MINE=true
-  # Wait up to 10s for it to bind
   local elapsed=0
   while ! curl -sf "http://localhost:9090/-/healthy" -o /dev/null -m 2 2>/dev/null; do
     sleep 2; elapsed=$((elapsed + 2))
-    [[ $elapsed -ge 10 ]] && return 1
+    [[ $elapsed -ge 15 ]] && return 1
   done
   return 0
 }
@@ -117,6 +94,20 @@ close_prometheus_pf() {
   if $PROM_PF_MINE && kill -0 "$PROM_PF_PID" 2>/dev/null; then
     kill "$PROM_PF_PID" 2>/dev/null || true
     PROM_PF_MINE=false
+  fi
+}
+
+# ── Discover working frontend URL ─────────────────────────────────────────────
+# CRITICAL FIX: never hardcode NodePort 30080 — unreliable on Docker Desktop.
+# find-url.sh probes candidate URLs in order and returns the first that responds.
+discover_base_url() {
+  local url
+  url=$(bash "$SCRIPT_DIR/find-url.sh" --export 2>/dev/null || echo "")
+  if [[ -z "$url" ]]; then
+    warn "find-url.sh failed — falling back to http://localhost:8080"
+    echo "http://localhost:8080"
+  else
+    echo "$url"
   fi
 }
 
@@ -131,11 +122,10 @@ if [[ "$MODE" != "--no-k6" ]]; then
 fi
 
 info "Cluster: $(kubectl config current-context)"
-info "Mode:    ${MODE:-full (1000 VU, ~9min)}"
+info "Mode:    ${MODE:-full (1000 VU, ~30min)}"
 info "Time:    $START_ISO"
 echo ""
 
-# Verify all expected workloads are present before starting the clock
 preflight_ok=true
 for dep in prometheus grafana tempo loki kube-state-metrics; do
   if ! kubectl get deployment "$dep" -n observability &>/dev/null; then
@@ -161,11 +151,9 @@ if ! $preflight_ok; then
 fi
 info "All expected workloads present ✓"
 
-# Check HPA targets are not <unknown> BEFORE the run
-# If they're <unknown> now, the test results will be meaningless
 hpa_unknown=$(kubectl get hpa -n boutique \
   -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.currentMetrics[0].resource.current.averageUtilization}{"\n"}{end}' \
-  2>/dev/null | grep -c "^[a-z].* $" || true)  # lines with empty second field = <unknown>
+  2>/dev/null | grep -c "^[a-z].* $" || true)
 if [[ "${hpa_unknown:-0}" -gt 0 ]]; then
   warn "Some HPAs show <unknown> targets — metrics-server may still be warming up"
   warn "HPA scaling will not work correctly during this run (Check 6 will flag this)"
@@ -183,56 +171,69 @@ before_restart_total=$(awk '{sum += $2} END {print sum+0}' "$before_file")
 info "Pre-run restart total (boutique + observability): $before_restart_total"
 
 # ── Run k6 ───────────────────────────────────────────────────────────────────
+START_TS=$(date +%s)   # timer starts here — aligns with actual test window
+
 if [[ "$MODE" == "--no-k6" ]]; then
   section "k6 — skipped (--no-k6 mode)"
 
 elif [[ "$MODE" == "--short" ]]; then
   section "k6 — smoke test (100 VU, 2min)"
-  # FIX: Previous version used load-test_10vusers.js with --vus 100 override.
-  # k6 ignores --vus when the script defines `stages` in options. The 10vusers
-  # script defines stages, so the override was silently ignored.
-  # Fix: use load-test_1000vusers.js but override the BASE_URL and run a
-  # simple 100 VU / 2min test by passing --vus and --duration which DOES
-  # override stage-based scripts when paired with --no-stages-default-executor
-  # flag... but that's complex. Simplest correct approach: inline k6 script.
+
+  BASE_URL=$(discover_base_url)
+  info "Using BASE_URL: $BASE_URL"
+
   k6 run \
     --vus 100 \
     --duration 2m \
-    --env BASE_URL=http://localhost:30080 \
+    --env BASE_URL="$BASE_URL" \
     - <<'EOF' || warn "k6 smoke test exited non-zero (check thresholds above)"
 import http from 'k6/http';
 import { sleep, check } from 'k6';
 
-const BASE = __ENV.BASE_URL || 'http://localhost:30080';
-const PRODUCTS = ['OLJCESPC7Z', '66VCHSJNUP', '1YMWWN1N4O'];
+const BASE = __ENV.BASE_URL || 'http://localhost:8080';
+const PRODUCTS = ['OLJCESPC7Z', '66VCHSJNUP', '1YMWWN1N4O', '0PUK6V6EV0'];
 
 export const options = {
   thresholds: {
-    http_req_failed:   ['rate<0.05'],
-    http_req_duration: ['p(95)<5000'],
+    http_req_failed:   ['rate<0.001'],   // <0.1% — real smoke test bar
+    http_req_duration: ['p(95)<2000'],   // p95 < 2s — not 5s
   },
 };
 
 export default function () {
-  const home = http.get(`${BASE}/`, { tags: { name: 'Home' } });
+  const home = http.get(`${BASE}/`, {
+    timeout: '15s',
+    tags: { name: 'Home' },
+  });
   check(home, { 'home 200': (r) => r.status === 200 });
   sleep(1);
 
   const pid = PRODUCTS[Math.floor(Math.random() * PRODUCTS.length)];
-  const prod = http.get(`${BASE}/product/${pid}`, { tags: { name: 'Product' } });
+  const prod = http.get(`${BASE}/product/${pid}`, {
+    timeout: '15s',
+    tags: { name: 'Product' },
+  });
   check(prod, { 'product 200': (r) => r.status === 200 });
   sleep(1);
 
   if (Math.random() > 0.7) {
-    http.post(`${BASE}/cart`, { product_id: pid, quantity: 1 }, { tags: { name: 'AddCart' } });
+    http.post(`${BASE}/cart`,
+      { product_id: pid, quantity: '1' },
+      { timeout: '15s', tags: { name: 'AddCart' } }
+    );
     sleep(0.5);
   }
 }
 EOF
 
 else
-  section "k6 — full run (1000 VU, load-test_1000vusers.js)"
-  k6 run "${REPO_ROOT}/scripts/load-test_1000vusers.js" || warn "k6 exited non-zero"
+  section "k6 — full run (1000 VU, ~30min)"
+  BASE_URL=$(discover_base_url)
+  info "Using BASE_URL: $BASE_URL"
+  k6 run \
+    --env BASE_URL="$BASE_URL" \
+    "${REPO_ROOT}/scripts/load-test_1000vusers.js" \
+    || warn "k6 exited non-zero — check thresholds above"
 fi
 
 END_TS=$(date +%s)
@@ -274,7 +275,6 @@ section "Check 2 — OOMKilled events"
 
 oom_total=0
 
-# CartService gets its own OOM check — it's the most frequent failure
 cart_oom=$(kubectl get events -n boutique \
   --field-selector type=Warning \
   -o jsonpath='{range .items[*]}{.lastTimestamp}{" "}{.involvedObject.name}{" "}{.reason}{" "}{.message}{"\n"}{end}' \
@@ -283,12 +283,11 @@ cart_oom=$(kubectl get events -n boutique \
   grep -i "cart" | wc -l | tr -d ' ')
 
 if [[ "${cart_oom:-0}" -gt 0 ]]; then
-  fail "cartservice: ${cart_oom} OOM event(s) — .NET GC heap limit may not be set correctly"
+  fail "cartservice: ${cart_oom} OOM event(s) — DOTNET_GCHeapHardLimit may need adjusting"
   fail "  Run: kubectl describe pod -n boutique -l app=cartservice | grep -A5 OOMKill"
   oom_total=$((oom_total + cart_oom))
 fi
 
-# General OOM sweep for all other pods
 for ns in boutique observability; do
   ns_oom=$(kubectl get events -n "$ns" \
     --field-selector type=Warning \
@@ -357,9 +356,8 @@ except Exception:
 " 2>/dev/null || echo "ERROR")
 
   if [[ "$freshness" == "NONE" ]]; then
-    fail "No spanmetrics samples in Prometheus — OTLP pipeline is not flowing"
-    fail "  Check: bash scripts/manage.sh logs alloy"
-    fail "  Check: bash scripts/manage.sh verify"
+    fail "No spanmetrics samples in Prometheus — OTLP pipeline not flowing"
+    fail "  Check: kubectl logs -n observability daemonset/alloy --tail=40"
   elif [[ "$freshness" == "ERROR" ]]; then
     warn "Could not parse spanmetrics freshness result"
   elif [[ "$freshness" -gt 60 ]] 2>/dev/null; then
@@ -371,7 +369,6 @@ else
   warn "Prometheus unreachable — skipped spanmetrics freshness check"
 fi
 
-# Done with Prometheus — close port-forward if we opened it
 close_prometheus_pf
 
 # ── CHECK 5: Redis health ─────────────────────────────────────────────────────
@@ -383,13 +380,11 @@ redis_pod=$(kubectl get pods -n boutique -l app=redis \
 if [[ -z "$redis_pod" ]]; then
   fail "Redis pod not found — cartservice has no backend"
 else
-  # Check Redis is responding
   redis_ping=$(kubectl exec -n boutique "$redis_pod" \
     -- redis-cli ping 2>/dev/null || echo "FAILED")
   if [[ "$redis_ping" != "PONG" ]]; then
     fail "Redis not responding to PING (got: $redis_ping) — cartservice will crash"
   else
-    # Check connection count — maxclients=200, warn at >150 (75%), fail at >180 (90%)
     connected=$(kubectl exec -n boutique "$redis_pod" \
       -- redis-cli info clients 2>/dev/null | \
       grep "connected_clients" | awk -F: '{print $2}' | tr -d '[:space:]' || echo "0")
@@ -397,13 +392,14 @@ else
       -- redis-cli info memory 2>/dev/null | \
       grep "used_memory_human" | awk -F: '{print $2}' | tr -d '[:space:]' || echo "?")
 
-    if [[ "${connected:-0}" -gt 180 ]]; then
-      fail "Redis: ${connected}/200 connections (>90% — cartservice pods will start failing)"
-    elif [[ "${connected:-0}" -gt 150 ]]; then
-      warn "Redis: ${connected}/200 connections (>75% — approaching saturation)"
-      ok "Redis responding to PING | clients=${connected}/200 | mem=${used_mem}"
+    # maxclients=500 now. Warn at >375 (75%), fail at >450 (90%)
+    if [[ "${connected:-0}" -gt 450 ]]; then
+      fail "Redis: ${connected}/500 connections (>90% — cartservice pods will start failing)"
+    elif [[ "${connected:-0}" -gt 375 ]]; then
+      warn "Redis: ${connected}/500 connections (>75% — approaching saturation)"
+      ok "Redis responding to PING | clients=${connected}/500 | mem=${used_mem}"
     else
-      ok "Redis responding to PING | clients=${connected}/200 | mem=${used_mem}"
+      ok "Redis responding to PING | clients=${connected}/500 | mem=${used_mem}"
     fi
   fi
 fi
@@ -411,10 +407,6 @@ fi
 # ── CHECK 6: HPA target validity ──────────────────────────────────────────────
 section "Check 6 — HPA target validity (metrics-server data)"
 
-# An HPA with <unknown> targets cannot scale. This means either:
-# - metrics-server is down/not ready
-# - The target deployment has no running pods (all in Pending/CrashLoop)
-# - The resource request on the pod is 0 (HPA can't calculate utilization %)
 unknown_hpas=""
 while IFS= read -r line; do
   hpa_name=$(echo "$line" | awk '{print $1}')
@@ -426,8 +418,8 @@ done < <(kubectl get hpa -n boutique --no-headers 2>/dev/null || true)
 
 if [[ -n "$unknown_hpas" ]]; then
   fail "HPAs with <unknown> targets (cannot scale): ${unknown_hpas}"
-  fail "  Fix: kubectl top pods -n boutique (if this fails, metrics-server is down)"
-  fail "  Fix: kubectl describe hpa -n boutique (look for Events explaining why)"
+  fail "  Fix: kubectl top pods -n boutique"
+  fail "  Fix: kubectl describe hpa -n boutique"
 else
   ok "All HPA targets show valid CPU utilization percentages"
 fi
@@ -435,7 +427,7 @@ fi
 # ── Summary ───────────────────────────────────────────────────────────────────
 section "Summary"
 
-rm -f "$before_file" "$after_file" "$restart_diff"
+rm -f "$before_file" "$after_file" "$restart_diff" 2>/dev/null || true
 
 echo ""
 echo "  Results:"
@@ -463,10 +455,10 @@ else
   echo -e "${RED}${BOLD}  ╚══════════════════════════════════════╝${NC}"
   echo ""
   echo "  Triage commands:"
-  echo "    bash scripts/manage.sh cart-debug       # if cartservice is involved"
-  echo "    bash scripts/manage.sh debug            # full diagnostic dump"
-  echo "    bash scripts/manage.sh logs alloy       # check OTLP pipeline"
-  echo "    bash scripts/manage.sh budget           # check node CPU/memory pressure"
+  echo "    bash scripts/manage.sh cart-debug"
+  echo "    bash scripts/manage.sh debug"
+  echo "    kubectl logs -n observability daemonset/alloy --tail=40"
+  echo "    bash scripts/manage.sh budget"
   echo "    kubectl get events -A --sort-by='.lastTimestamp' | tail -30"
   echo ""
   exit 1

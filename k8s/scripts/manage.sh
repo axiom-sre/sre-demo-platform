@@ -15,6 +15,9 @@
 #   bash scripts/manage.sh hpa-watch         live HPA scaling monitor (refreshes every 5s)
 #   bash scripts/manage.sh restart <svc> [ns] rolling restart a deployment
 #   bash scripts/manage.sh top               kubectl top pods for both namespaces
+#   bash scripts/manage.sh suspend           scale all to 0, free RAM (keeps PVCs/config)
+#   bash scripts/manage.sh resume            restore replicas from suspend (fast)
+#   bash scripts/manage.sh grafana-export    export Grafana UI edits to JSON files
 #
 # KEY CHANGES vs previous version:
 #   1. stop: now deletes resources in reverse dependency order — alloy first
@@ -460,6 +463,132 @@ top_pods() {
 }
 
 # ── dispatch ──────────────────────────────────────────────────────────────────
+
+# ── suspend ────────────────────────────────────────────────────────────────────
+# Scale all deployments to 0 — keeps namespaces/PVCs/config intact.
+# Frees ~3-4GB RAM immediately. Docker Desktop itself stays running.
+# Resume with: bash scripts/manage.sh resume
+suspend() {
+  info "Suspending platform — scaling all deployments to 0..."
+  info "(PVCs, ConfigMaps, namespaces preserved — resume is fast)"
+
+  pkill -f "kubectl port-forward" 2>/dev/null || true
+  [[ -f "$PF_PID_FILE" ]] && rm -f "$PF_PID_FILE"
+  info "Port-forwards stopped ✓"
+
+  # Scale observability down (alloy is DaemonSet — patch nodeSelector to prevent scheduling)
+  for dep in grafana prometheus loki tempo kube-state-metrics; do
+    kubectl scale deployment/$dep -n observability --replicas=0 2>/dev/null &&       info "  $dep → 0" || true
+  done
+  kubectl patch daemonset alloy -n observability     -p '{"spec":{"template":{"spec":{"nodeSelector":{"suspend":"true"}}}}}'     2>/dev/null && info "  alloy (DaemonSet) → suspended" || true
+
+  # Scale boutique down
+  for dep in frontend cartservice checkoutservice productcatalogservice               currencyservice recommendationservice shippingservice               paymentservice emailservice adservice redis; do
+    kubectl scale deployment/$dep -n boutique --replicas=0 2>/dev/null &&       info "  $dep → 0" || true
+  done
+
+  echo ""
+  info "Platform suspended ✓ — Docker Desktop RAM freed"
+  info "To resume:  bash scripts/manage.sh resume"
+  info "To destroy: bash scripts/manage.sh nuke"
+}
+
+# ── resume ─────────────────────────────────────────────────────────────────────
+# Restore all deployments to their normal replica counts.
+# Much faster than start.sh — no image pulls, config already applied.
+resume() {
+  info "Resuming platform — restoring replica counts..."
+
+  # Restore alloy DaemonSet (remove the suspend nodeSelector)
+  kubectl patch daemonset alloy -n observability     --type=json     -p='[{"op":"remove","path":"/spec/template/spec/nodeSelector/suspend"}]'     2>/dev/null && info "  alloy DaemonSet → restored" || true
+
+  # Restore observability
+  kubectl scale deployment/prometheus    -n observability --replicas=1 2>/dev/null
+  kubectl scale deployment/loki         -n observability --replicas=1 2>/dev/null
+  kubectl scale deployment/tempo        -n observability --replicas=1 2>/dev/null
+  kubectl scale deployment/grafana      -n observability --replicas=1 2>/dev/null
+  kubectl scale deployment/kube-state-metrics -n observability --replicas=1 2>/dev/null
+
+  # Restore boutique
+  kubectl scale deployment/redis               -n boutique --replicas=1 2>/dev/null
+  kubectl scale deployment/cartservice         -n boutique --replicas=2 2>/dev/null
+  kubectl scale deployment/frontend            -n boutique --replicas=2 2>/dev/null
+  kubectl scale deployment/checkoutservice     -n boutique --replicas=2 2>/dev/null
+  kubectl scale deployment/productcatalogservice -n boutique --replicas=2 2>/dev/null
+  kubectl scale deployment/currencyservice     -n boutique --replicas=2 2>/dev/null
+  kubectl scale deployment/recommendationservice -n boutique --replicas=2 2>/dev/null
+  kubectl scale deployment/shippingservice     -n boutique --replicas=1 2>/dev/null
+  kubectl scale deployment/paymentservice      -n boutique --replicas=1 2>/dev/null
+  kubectl scale deployment/emailservice        -n boutique --replicas=1 2>/dev/null
+  kubectl scale deployment/adservice           -n boutique --replicas=1 2>/dev/null
+
+  info "Replica counts restored ✓"
+  info "Restarting port-forwards..."
+
+  SCRIPT_DIR_LOCAL="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  bash "$SCRIPT_DIR_LOCAL/start.sh" --pf-only
+
+  echo ""
+  info "Waiting for cartservice (.NET JIT — up to 90s)..."
+  kubectl rollout status deployment/cartservice -n boutique --timeout=150s 2>/dev/null ||     warn "Cart still starting — check: kubectl get pods -n boutique"
+
+  echo ""
+  info "Platform resumed ✓"
+  info "Run warm gate check: curl -s http://localhost:8080/ | grep -i 'sunglasses\|camera'"
+  info "Run smoke test:      k6 run scripts/load-test_10vusers.js"
+}
+
+# ── grafana-export ─────────────────────────────────────────────────────────────
+# Export all Grafana dashboards to k8s/observability/grafana/dashboards/
+# Run this BEFORE nuking to preserve dashboard edits made in the Grafana UI.
+# On next start.sh, dashboards are loaded from the ConfigMap automatically
+# IF you update grafana.yaml with the exported JSON.
+grafana_export() {
+  local out_dir="${REPO_ROOT}/observability/grafana/dashboards"
+  mkdir -p "$out_dir"
+
+  info "Exporting Grafana dashboards to $out_dir ..."
+  info "(Grafana must be port-forwarded on :3000)"
+
+  # Get all dashboard UIDs
+  local uids
+  uids=$(curl -sf "http://localhost:3000/api/search?type=dash-db"     -u admin:admin 2>/dev/null | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for d in data:
+    print(d['uid'] + '|' + d['title'].replace('/', '-').replace(' ', '_'))
+" 2>/dev/null)
+
+  if [[ -z "$uids" ]]; then
+    warn "Could not reach Grafana at localhost:3000 — is port-forward running?"
+    warn "Run: bash scripts/start.sh --pf-only"
+    return 1
+  fi
+
+  local count=0
+  while IFS='|' read -r uid title; do
+    local fname="${out_dir}/${uid}-${title}.json"
+    if curl -sf "http://localhost:3000/api/dashboards/uid/$uid"         -u admin:admin 2>/dev/null         | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+# Strip server-side metadata, keep the dashboard definition
+out = d['dashboard']
+out['id'] = None  # clear id so Grafana imports cleanly
+json.dump(out, sys.stdout, indent=2)
+" > "$fname" 2>/dev/null; then
+      info "  Exported: $title → $(basename $fname)"
+      count=$((count + 1))
+    else
+      warn "  Failed: $title (uid: $uid)"
+    fi
+  done <<< "$uids"
+
+  echo ""
+  info "$count dashboard(s) exported to $out_dir"
+  warn "NEXT STEP: Update grafana.yaml ConfigMaps with the exported JSON"
+  warn "then commit: git add observability/grafana/dashboards/ && git commit -m 'export: grafana dashboards'"
+}
+
 case "$CMD" in
   stop)        stop ;;
   nuke)        nuke ;;
@@ -472,6 +601,9 @@ case "$CMD" in
   hpa-watch)   hpa_watch ;;
   restart)     restart_svc "$@" ;;
   top)         top_pods ;;
+  suspend)     suspend ;;
+  resume)      resume ;;
+  grafana-export) grafana_export ;;
   *)
     echo ""
     echo -e "${BOLD}Usage: bash scripts/manage.sh <command>${NC}"
@@ -488,6 +620,9 @@ case "$CMD" in
     echo "  hpa-watch               live HPA scaling monitor (refreshes 5s)"
     echo "  restart <svc> [ns]      rolling restart a deployment"
     echo "  top                     kubectl top pods for both namespaces"
+  echo "  suspend                 scale all to 0, free RAM (keeps PVCs)"
+  echo "  resume                  restore from suspend (fast, no image pulls)"
+  echo "  grafana-export          export dashboard edits to JSON files"
     echo ""
     echo "Startup:    bash scripts/start.sh"
     echo "Stability:  bash scripts/verify-stability.sh [--short|--no-k6]"

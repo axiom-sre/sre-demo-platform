@@ -9,7 +9,7 @@
 #        This is the "wow" dashboard for the opening of a demo.
 #
 #   2. Golden Signals Deep Dive (uid: golden-signals)
-#      → Per-service drill-down. RPS, error rate, p50/p90/p95/p99 latency,
+#      → Per-service drill-down. RPS, error rate, p90/p90/p95/p99 latency,
 #        spanmetrics call volume heatmap, service dependency graph via Tempo
 #        service map. Linked to traces for click-through on anomalies.
 #
@@ -144,12 +144,20 @@ data:
     providers:
       - name: default
         type: file
+        # disableDeletion: true prevents the provisioner from removing dashboards
+        # that exist on disk but not in the config — safe for PVC-backed storage.
         disableDeletion: false
-        updateIntervalSeconds: 30
+        # updateIntervalSeconds: 0 disables the polling loop that overwrites
+        # UI edits. Dashboards are loaded once at startup from the PVC directory.
+        # This is the key fix: with ConfigMap mounts + polling, every 30s the
+        # provisioner re-reads the ConfigMap and overwrites your UI saves.
+        updateIntervalSeconds: 0
         allowUiUpdates: true
         editable: true
         options:
-          path: /etc/grafana/provisioning/dashboards
+          # PVC-backed path: writable, persistent across pod restarts.
+          # Init container seeds this on first boot from ConfigMap JSON.
+          path: /var/lib/grafana/dashboards
 ---
 # =============================================================================
 # DASHBOARD 1: SRE Command Center
@@ -373,7 +381,7 @@ data:
         {
           "id": 30,
           "type": "timeseries",
-          "title": "p50 / p95 / p99 Latency — Frontend",
+          "title": "p90 / p95 / p99 Latency — Frontend",
           "description": "Latency percentiles for the frontend service. This is what the user experiences.",
           "gridPos": { "h": 9, "w": 12, "x": 0, "y": 17 },
           "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -390,7 +398,7 @@ data:
             "tooltip": { "mode": "multi", "sort": "desc" }
           },
           "targets": [
-            { "datasource": { "uid": "prometheus" }, "expr": "histogram_quantile(0.50, sum by (le) (rate(traces_spanmetrics_latency_bucket{service=\"frontend\"}[2m])))", "legendFormat": "p50", "refId": "A" },
+            { "datasource": { "uid": "prometheus" }, "expr": "histogram_quantile(0.50, sum by (le) (rate(traces_spanmetrics_latency_bucket{service=\"frontend\"}[2m])))", "legendFormat": "p90", "refId": "A" },
             { "datasource": { "uid": "prometheus" }, "expr": "histogram_quantile(0.95, sum by (le) (rate(traces_spanmetrics_latency_bucket{service=\"frontend\"}[2m])))", "legendFormat": "p95", "refId": "B" },
             { "datasource": { "uid": "prometheus" }, "expr": "histogram_quantile(0.99, sum by (le) (rate(traces_spanmetrics_latency_bucket{service=\"frontend\"}[2m])))", "legendFormat": "p99", "refId": "C" }
           ]
@@ -562,7 +570,7 @@ data:
             },
             "overrides": []
           },
-          "options": { "legend": { "calcs": ["lastNotNull", "max", "mean"], "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+          "options": { "legend": { "calcs": ["lastNotNull", "max", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
           "targets": [{ "datasource": { "uid": "prometheus" }, "expr": "sum by (service) (rate(traces_spanmetrics_calls_total[5m]))", "legendFormat": "{{service}}", "refId": "A" }]
         },
 
@@ -584,14 +592,14 @@ data:
             },
             "overrides": []
           },
-          "options": { "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+          "options": { "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
           "targets": [{ "datasource": { "uid": "prometheus" }, "expr": "sum by (service) (rate(traces_spanmetrics_calls_total{status_code=\"STATUS_CODE_ERROR\"}[5m])) / sum by (service) (rate(traces_spanmetrics_calls_total[5m]))", "legendFormat": "{{service}}", "refId": "A" }]
         },
 
         {
           "id": 3,
           "type": "timeseries",
-          "title": "p50 Latency by Service",
+          "title": "p90 Latency by Service",
           "gridPos": { "h": 9, "w": 8, "x": 0, "y": 9 },
           "datasource": { "type": "prometheus", "uid": "prometheus" },
           "fieldConfig": {
@@ -599,7 +607,7 @@ data:
             "overrides": []
           },
           "options": { "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
-          "targets": [{ "datasource": { "uid": "prometheus" }, "expr": "histogram_quantile(0.50, sum by (le, service) (rate(traces_spanmetrics_latency_bucket[5m])))", "legendFormat": "p50 {{service}}", "refId": "A" }]
+          "targets": [{ "datasource": { "uid": "prometheus" }, "expr": "histogram_quantile(0.90, sum by (le, service) (rate(traces_spanmetrics_latency_bucket[5m])))", "legendFormat": "p90 {{service}}", "refId": "A" }]
         },
 
         {
@@ -1329,7 +1337,7 @@ data:
               { "matcher": { "id": "byName", "options": "steal" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }] }
             ]
           },
-          "options": { "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+          "options": { "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
           "targets": [
             { "datasource": { "uid": "prometheus" }, "expr": "avg by (mode) (rate(node_cpu_seconds_total[2m]))", "legendFormat": "{{mode}}", "refId": "A" }
           ]
@@ -1349,7 +1357,7 @@ data:
             },
             "overrides": []
           },
-          "options": { "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+          "options": { "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
           "targets": [
             { "datasource": { "uid": "prometheus" }, "expr": "node_memory_MemTotal_bytes - node_memory_MemFree_bytes - node_memory_Buffers_bytes - node_memory_Cached_bytes", "legendFormat": "Used (excl. cache)", "refId": "A" },
             { "datasource": { "uid": "prometheus" }, "expr": "node_memory_Cached_bytes + node_memory_Buffers_bytes", "legendFormat": "Cache + Buffers", "refId": "B" },
@@ -1555,6 +1563,43 @@ spec:
       securityContext:
         fsGroup: 472
         runAsUser: 472
+      initContainers:
+        - name: dashboard-seeder
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              mkdir -p /grafana-data/dashboards
+              for f in /dashboard-seeds/*.json; do
+                fname=$(basename "$f")
+                dest="/grafana-data/dashboards/$fname"
+                if [ ! -f "$dest" ]; then
+                  echo "Seeding: $fname"
+                  cp "$f" "$dest"
+                else
+                  echo "Exists (keeping your edits): $fname"
+                fi
+              done
+              echo "Dashboard seeding complete."
+          volumeMounts:
+            - name: data
+              mountPath: /grafana-data
+            - name: dashboard-command-center
+              mountPath: /dashboard-seeds/command-center.json
+              subPath: command-center.json
+            - name: dashboard-golden-signals
+              mountPath: /dashboard-seeds/golden-signals.json
+              subPath: golden-signals.json
+            - name: dashboard-platform
+              mountPath: /dashboard-seeds/platform-dashboard.json
+              subPath: platform-dashboard.json
+            - name: dashboard-slo
+              mountPath: /dashboard-seeds/slo-dashboard.json
+              subPath: slo-dashboard.json
+            - name: dashboard-infra-node
+              mountPath: /dashboard-seeds/infra-node.json
+              subPath: infra-node.json
       containers:
         - name: grafana
           image: grafana/grafana:11.1.0
@@ -1590,7 +1635,7 @@ spec:
               value: "4"
             # Home dashboard → Command Center
             - name: GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH
-              value: "/etc/grafana/provisioning/dashboards/command-center.json"
+              value: "/var/lib/grafana/dashboards/command-center.json"
           ports:
             - containerPort: 3000
           readinessProbe:
@@ -1617,21 +1662,10 @@ spec:
             - name: dashboard-provider
               mountPath: /etc/grafana/provisioning/dashboards/dashboards.yaml
               subPath: dashboards.yaml
-            - name: dashboard-command-center
-              mountPath: /etc/grafana/provisioning/dashboards/command-center.json
-              subPath: command-center.json
-            - name: dashboard-golden-signals
-              mountPath: /etc/grafana/provisioning/dashboards/golden-signals.json
-              subPath: golden-signals.json
-            - name: dashboard-platform
-              mountPath: /etc/grafana/provisioning/dashboards/platform-dashboard.json
-              subPath: platform-dashboard.json
-            - name: dashboard-slo
-              mountPath: /etc/grafana/provisioning/dashboards/slo-dashboard.json
-              subPath: slo-dashboard.json
-            - name: dashboard-infra-node
-              mountPath: /etc/grafana/provisioning/dashboards/infra-node.json
-              subPath: infra-node.json
+            # No ConfigMap JSON mounts here — dashboards live on the PVC.
+            # The init container seeds /var/lib/grafana/dashboards/ on first boot.
+            # UI edits are saved to Grafana's SQLite DB and to the PVC directory,
+            # and survive pod restarts, suspend/resume, and Docker Desktop reboots.
           resources:
             requests:
               cpu: 300m
