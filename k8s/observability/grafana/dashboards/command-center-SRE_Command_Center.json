@@ -66,7 +66,7 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 4,
+        "h": 3,
         "w": 24,
         "x": 0,
         "y": 0
@@ -186,7 +186,7 @@
         "h": 4,
         "w": 4,
         "x": 0,
-        "y": 4
+        "y": 3
       },
       "id": 10,
       "options": {
@@ -230,7 +230,7 @@
           "color": {
             "mode": "thresholds"
           },
-          "decimals": 3,
+          "decimals": 2,
           "mappings": [],
           "max": 1,
           "min": 0,
@@ -244,11 +244,11 @@
               },
               {
                 "color": "yellow",
-                "value": 0.001
+                "value": 0.01
               },
               {
                 "color": "red",
-                "value": 0.01
+                "value": 0.05
               }
             ]
           },
@@ -260,7 +260,7 @@
         "h": 4,
         "w": 4,
         "x": 4,
-        "y": 4
+        "y": 3
       },
       "id": 11,
       "options": {
@@ -304,7 +304,7 @@
           "color": {
             "mode": "thresholds"
           },
-          "decimals": 3,
+          "decimals": 1,
           "mappings": [],
           "thresholds": {
             "mode": "absolute",
@@ -331,7 +331,7 @@
         "h": 4,
         "w": 4,
         "x": 8,
-        "y": 4
+        "y": 3
       },
       "id": 12,
       "options": {
@@ -401,7 +401,7 @@
         "h": 4,
         "w": 4,
         "x": 12,
-        "y": 4
+        "y": 3
       },
       "id": 13,
       "options": {
@@ -474,7 +474,7 @@
         "h": 4,
         "w": 4,
         "x": 16,
-        "y": 4
+        "y": 3
       },
       "id": 14,
       "options": {
@@ -547,7 +547,7 @@
         "h": 4,
         "w": 4,
         "x": 20,
-        "y": 4
+        "y": 3
       },
       "id": 15,
       "options": {
@@ -646,7 +646,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 8
+        "y": 7
       },
       "id": 20,
       "options": {
@@ -697,6 +697,7 @@
             "axisColorMode": "text",
             "axisLabel": "",
             "axisPlacement": "auto",
+            "axisSoftMin": 0,
             "barAlignment": 0,
             "drawStyle": "line",
             "fillOpacity": 5,
@@ -723,7 +724,7 @@
               "mode": "dashed"
             }
           },
-          "decimals": 2,
+          "decimals": 3,
           "mappings": [],
           "thresholds": {
             "mode": "absolute",
@@ -734,11 +735,11 @@
               },
               {
                 "color": "yellow",
-                "value": 0.001
+                "value": 0.005
               },
               {
                 "color": "red",
-                "value": 0.01
+                "value": 0.02
               }
             ]
           },
@@ -750,7 +751,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 8
+        "y": 7
       },
       "id": 21,
       "options": {
@@ -848,7 +849,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 17
+        "y": 16
       },
       "id": 30,
       "options": {
@@ -990,7 +991,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 17
+        "y": 16
       },
       "id": 31,
       "options": {
@@ -1275,7 +1276,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 26
+        "y": 25
       },
       "id": 40,
       "options": {
@@ -1461,7 +1462,7 @@
         "h": 10,
         "w": 24,
         "x": 0,
-        "y": 34
+        "y": 33
       },
       "id": 50,
       "options": {
@@ -1550,7 +1551,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 44
+        "y": 43
       },
       "id": 60,
       "options": {
@@ -1595,6 +1596,6 @@
   "timezone": "",
   "title": "SRE Command Center",
   "uid": "command-center",
-  "version": 7,
+  "version": 13,
   "weekStart": ""
 }
