@@ -18,6 +18,7 @@
 #   bash scripts/manage.sh suspend           scale all to 0, free RAM (keeps PVCs/config)
 #   bash scripts/manage.sh resume            restore replicas from suspend (fast)
 #   bash scripts/manage.sh grafana-export    export Grafana UI edits to JSON files
+#   bash scripts/manage.sh doctor            health check everything in one command
 #
 # KEY CHANGES vs previous version:
 #   1. stop: now deletes resources in reverse dependency order — alloy first
@@ -499,6 +500,32 @@ suspend() {
 resume() {
   info "Resuming platform — restoring replica counts..."
 
+  # ── Cluster health check ────────────────────────────────────────────────────
+  # Docker Desktop upgrades wipe Kubernetes state entirely.
+  # Detect this by checking if our namespaces still exist.
+  # If they don't, resume is impossible — redirect to start.sh.
+  if ! kubectl get namespace boutique &>/dev/null 2>&1; then
+    warn "Boutique namespace missing — cluster was likely wiped by a Docker Desktop upgrade."
+    warn "Resume is not possible. Running full start instead..."
+    echo ""
+    SCRIPT_DIR_LOCAL="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    exec bash "$SCRIPT_DIR_LOCAL/start.sh"
+  fi
+  if ! kubectl get namespace observability &>/dev/null 2>&1; then
+    warn "Observability namespace missing — cluster state is incomplete."
+    warn "Running full start instead..."
+    echo ""
+    SCRIPT_DIR_LOCAL="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    exec bash "$SCRIPT_DIR_LOCAL/start.sh"
+  fi
+
+  # ── PVC health check ────────────────────────────────────────────────────────
+  # If Grafana PVC is gone, warn before proceeding — dashboard edits will be lost.
+  if ! kubectl get pvc grafana-pvc -n observability &>/dev/null 2>&1; then
+    warn "grafana-pvc missing — dashboard edits from previous session are lost."
+    warn "Continuing resume — Grafana will re-seed from ConfigMap defaults."
+  fi
+
   # Restore alloy DaemonSet (remove the suspend nodeSelector)
   kubectl patch daemonset alloy -n observability     --type=json     -p='[{"op":"remove","path":"/spec/template/spec/nodeSelector/suspend"}]'     2>/dev/null && info "  alloy DaemonSet → restored" || true
 
@@ -523,8 +550,17 @@ resume() {
   kubectl scale deployment/adservice           -n boutique --replicas=1 2>/dev/null
 
   info "Replica counts restored ✓"
-  info "Restarting port-forwards..."
 
+  # Wait for observability pods BEFORE starting port-forwards.
+  # Without this, port-forward connects before the pod is Ready and silently fails.
+  # Grafana has an init container (dashboard-seeder) that adds ~15s to startup.
+  info "Waiting for observability stack to be ready..."
+  kubectl rollout status deployment/prometheus -n observability --timeout=120s 2>/dev/null     && info "  prometheus ✓" || warn "  prometheus slow"
+  kubectl rollout status deployment/grafana -n observability --timeout=120s 2>/dev/null     && info "  grafana ✓" || warn "  grafana slow — check: kubectl describe pod -n observability -l app=grafana"
+  kubectl rollout status deployment/loki  -n observability --timeout=60s 2>/dev/null     && info "  loki ✓" || true
+  kubectl rollout status deployment/tempo -n observability --timeout=60s 2>/dev/null     && info "  tempo ✓" || true
+
+  info "Restarting port-forwards..."
   SCRIPT_DIR_LOCAL="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   bash "$SCRIPT_DIR_LOCAL/start.sh" --pf-only
 
@@ -534,8 +570,9 @@ resume() {
 
   echo ""
   info "Platform resumed ✓"
-  info "Run warm gate check: curl -s http://localhost:8080/ | grep -i 'sunglasses\|camera'"
-  info "Run smoke test:      k6 run scripts/load-test_10vusers.js"
+  info "  Grafana:  http://localhost:3000  (admin/admin)"
+  info "  Boutique: http://localhost:8080"
+  info "  Smoke:    k6 run scripts/load-test_10vusers.js"
 }
 
 # ── grafana-export ─────────────────────────────────────────────────────────────
@@ -589,6 +626,73 @@ json.dump(out, sys.stdout, indent=2)
   warn "then commit: git add observability/grafana/dashboards/ && git commit -m 'export: grafana dashboards'"
 }
 
+# ── doctor ────────────────────────────────────────────────────────────────────
+# Quick health check — run after resume or when something feels off.
+# Checks: cluster reachable, namespaces exist, all pods running, PVCs bound,
+# port-forwards alive, Grafana API responding, spanmetrics flowing.
+doctor() {
+  local ok=0 warn_count=0
+  pass() { echo -e "  ${GREEN}✓${NC} $*"; }
+  fail() { echo -e "  ${RED}✗${NC} $*"; warn_count=$((warn_count+1)); }
+  maybe() { echo -e "  ${YELLOW}~${NC} $*"; }
+
+  echo ""
+  echo -e "${BOLD}── Cluster ──────────────────────────────────────${NC}"
+  kubectl cluster-info &>/dev/null && pass "cluster reachable" || fail "cluster unreachable — is Docker Desktop running?"
+  kubectl get ns boutique &>/dev/null && pass "boutique namespace" || fail "boutique namespace missing — run: bash scripts/start.sh"
+  kubectl get ns observability &>/dev/null && pass "observability namespace" || fail "observability namespace missing — run: bash scripts/start.sh"
+
+  echo ""
+  echo -e "${BOLD}── Pods ─────────────────────────────────────────${NC}"
+  local not_running
+  not_running=$(kubectl get pods -n observability -n boutique     --field-selector='status.phase!=Running'     -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '
+' | grep -v "^$" || true)
+  if [[ -z "$not_running" ]]; then
+    pass "all pods Running"
+  else
+    fail "non-running pods: $not_running"
+  fi
+
+  echo ""
+  echo -e "${BOLD}── PVCs ─────────────────────────────────────────${NC}"
+  for pvc in grafana-pvc prometheus-pvc tempo-pvc; do
+    local status
+    status=$(kubectl get pvc $pvc -n observability -o jsonpath='{.status.phase}' 2>/dev/null || echo "MISSING")
+    if [[ "$status" == "Bound" ]]; then
+      pass "$pvc: Bound"
+    else
+      fail "$pvc: $status"
+    fi
+  done
+
+  echo ""
+  echo -e "${BOLD}── Port-forwards ────────────────────────────────${NC}"
+  curl -sf http://localhost:8080/_healthz -o /dev/null -m 3 && pass "boutique :8080" || fail "boutique :8080 — run: bash scripts/start.sh --pf-only"
+  curl -sf http://localhost:3000/api/health -o /dev/null -m 3 && pass "grafana :3000" || fail "grafana :3000 — run: bash scripts/start.sh --pf-only"
+  curl -sf http://localhost:9090/-/healthy -o /dev/null -m 3 && pass "prometheus :9090" || fail "prometheus :9090"
+  curl -sf http://localhost:12345/-/ready -o /dev/null -m 3 && pass "alloy :12345" || fail "alloy :12345"
+  curl -sf http://localhost:3200/ready -o /dev/null -m 3 && pass "tempo :3200" || fail "tempo :3200"
+  curl -sf http://localhost:3100/ready -o /dev/null -m 3 && pass "loki :3100" || fail "loki :3100"
+
+  echo ""
+  echo -e "${BOLD}── Observability pipeline ───────────────────────${NC}"
+  local series
+  series=$(curl -sf "http://localhost:9090/api/v1/query?query=traces_spanmetrics_calls_total"     2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d['data']['result']))" 2>/dev/null || echo "0")
+  if [[ "$series" -gt 0 ]]; then
+    pass "spanmetrics flowing ($series series)"
+  else
+    maybe "spanmetrics: 0 series — send some traffic first: k6 run scripts/load-test_10vusers.js"
+  fi
+
+  echo ""
+  if [[ $warn_count -eq 0 ]]; then
+    echo -e "${GREEN}All checks passed ✓ — stack is healthy${NC}"
+  else
+    echo -e "${RED}$warn_count check(s) failed — see above${NC}"
+  fi
+  echo ""
+}
+
 case "$CMD" in
   stop)        stop ;;
   nuke)        nuke ;;
@@ -604,6 +708,7 @@ case "$CMD" in
   suspend)     suspend ;;
   resume)      resume ;;
   grafana-export) grafana_export ;;
+  doctor)      doctor ;;
   *)
     echo ""
     echo -e "${BOLD}Usage: bash scripts/manage.sh <command>${NC}"
@@ -623,6 +728,7 @@ case "$CMD" in
   echo "  suspend                 scale all to 0, free RAM (keeps PVCs)"
   echo "  resume                  restore from suspend (fast, no image pulls)"
   echo "  grafana-export          export dashboard edits to JSON files"
+  echo "  doctor                  health check — cluster, pods, PVCs, port-forwards, pipeline"
     echo ""
     echo "Startup:    bash scripts/start.sh"
     echo "Stability:  bash scripts/verify-stability.sh [--short|--no-k6]"

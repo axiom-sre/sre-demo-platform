@@ -1,4 +1,4 @@
-# observability/grafana/grafana.yaml — Holy Grail Edition v2
+# observability/grafana/grafana.yaml — Holy Grail Edition v3
 # =============================================================================
 # DASHBOARDS (5 total — world-class SRE demo quality):
 #
@@ -1565,7 +1565,14 @@ spec:
         runAsUser: 472
       initContainers:
         - name: dashboard-seeder
-          image: busybox:1.36
+          image: alpine:3.19
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
           command:
             - sh
             - -c
