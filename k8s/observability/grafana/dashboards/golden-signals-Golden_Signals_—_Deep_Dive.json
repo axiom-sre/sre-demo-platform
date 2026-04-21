@@ -304,8 +304,10 @@
           "datasource": {
             "uid": "prometheus"
           },
-          "expr": "histogram_quantile(0.90, sum by (le, service) (rate(traces_spanmetrics_latency_bucket[5m])))",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.90, sum by (le, service) (rate(traces_spanmetrics_latency_bucket[1m])))",
           "legendFormat": "p90 {{service}}",
+          "range": true,
           "refId": "A"
         }
       ],
@@ -403,8 +405,10 @@
           "datasource": {
             "uid": "prometheus"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, service) (rate(traces_spanmetrics_latency_bucket[5m])))",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le, service) (rate(traces_spanmetrics_latency_bucket[1m])))",
           "legendFormat": "p95 {{service}}",
+          "range": true,
           "refId": "A"
         }
       ],
@@ -502,8 +506,10 @@
           "datasource": {
             "uid": "prometheus"
           },
-          "expr": "histogram_quantile(0.99, sum by (le, service) (rate(traces_spanmetrics_latency_bucket[5m])))",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le, service) (rate(traces_spanmetrics_latency_bucket[1m])))",
           "legendFormat": "p99 {{service}}",
+          "range": true,
           "refId": "A"
         }
       ],
@@ -571,7 +577,7 @@
               }
             ]
           },
-          "unit": "percent"
+          "unit": "percentunit"
         },
         "overrides": []
       },
@@ -965,6 +971,6 @@
   "timezone": "",
   "title": "Golden Signals \u2014 Deep Dive",
   "uid": "golden-signals",
-  "version": 2,
+  "version": 3,
   "weekStart": ""
 }

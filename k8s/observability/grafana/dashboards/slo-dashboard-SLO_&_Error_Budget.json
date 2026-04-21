@@ -1,10 +1,25 @@
 {
   "annotations": {
-    "list": []
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
   },
   "editable": true,
+  "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
   "id": null,
+  "links": [],
   "panels": [
     {
       "datasource": {
@@ -17,6 +32,9 @@
             "mode": "thresholds"
           },
           "decimals": 3,
+          "mappings": [],
+          "max": 1,
+          "min": 0,
           "noValue": "No traffic",
           "thresholds": {
             "mode": "absolute",
@@ -49,13 +67,21 @@
       "options": {
         "colorMode": "background",
         "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
-          ]
+          ],
+          "fields": "",
+          "values": false
         },
-        "textMode": "auto"
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
       },
+      "pluginVersion": "11.1.0",
       "targets": [
         {
           "datasource": {
@@ -81,6 +107,9 @@
             "mode": "thresholds"
           },
           "decimals": 2,
+          "mappings": [],
+          "max": 1,
+          "min": 0,
           "noValue": "No traffic",
           "thresholds": {
             "mode": "absolute",
@@ -113,13 +142,21 @@
       "options": {
         "colorMode": "background",
         "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
-          ]
+          ],
+          "fields": "",
+          "values": false
         },
-        "textMode": "auto"
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
       },
+      "pluginVersion": "11.1.0",
       "targets": [
         {
           "datasource": {
@@ -144,6 +181,9 @@
             "mode": "thresholds"
           },
           "decimals": 2,
+          "mappings": [],
+          "max": 1,
+          "min": 0,
           "noValue": "No traffic",
           "thresholds": {
             "mode": "absolute",
@@ -176,13 +216,21 @@
       "options": {
         "colorMode": "background",
         "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
-          ]
+          ],
+          "fields": "",
+          "values": false
         },
-        "textMode": "auto"
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
       },
+      "pluginVersion": "11.1.0",
       "targets": [
         {
           "datasource": {
@@ -208,6 +256,7 @@
             "mode": "thresholds"
           },
           "decimals": 2,
+          "mappings": [],
           "noValue": "No traffic",
           "thresholds": {
             "mode": "absolute",
@@ -244,13 +293,21 @@
       "options": {
         "colorMode": "background",
         "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
-          ]
+          ],
+          "fields": "",
+          "values": false
         },
-        "textMode": "auto"
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
       },
+      "pluginVersion": "11.1.0",
       "targets": [
         {
           "datasource": {
@@ -275,17 +332,39 @@
             "mode": "palette-classic"
           },
           "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
             "drawStyle": "line",
             "fillOpacity": 8,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
             "lineInterpolation": "smooth",
             "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
             "showPoints": "never",
             "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
             "thresholdsStyle": {
               "mode": "dashed"
             }
           },
           "decimals": 2,
+          "mappings": [],
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -401,17 +480,39 @@
             "mode": "palette-classic"
           },
           "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
             "drawStyle": "line",
             "fillOpacity": 5,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
             "lineInterpolation": "smooth",
             "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
             "showPoints": "never",
             "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
             "thresholdsStyle": {
               "mode": "dashed"
             }
           },
           "decimals": 2,
+          "mappings": [],
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -433,7 +534,7 @@
               }
             ]
           },
-          "unit": "short"
+          "unit": "percent"
         },
         "overrides": [
           {
@@ -567,16 +668,38 @@
             "mode": "palette-classic"
           },
           "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
             "drawStyle": "line",
             "fillOpacity": 5,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
             "lineInterpolation": "smooth",
             "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
             "showPoints": "never",
             "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
             "thresholdsStyle": {
               "mode": "dashed"
             }
           },
+          "mappings": [],
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -590,7 +713,7 @@
               },
               {
                 "color": "red",
-                "value": 2.0
+                "value": 2
               }
             ]
           },
@@ -681,19 +804,24 @@
       "type": "timeseries"
     }
   ],
-  "refresh": "15s",
+  "refresh": "auto",
   "schemaVersion": 39,
   "tags": [
     "boutique",
     "slo",
     "error-budget"
   ],
+  "templating": {
+    "list": []
+  },
   "time": {
     "from": "now-1h",
     "to": "now"
   },
   "timepicker": {},
+  "timezone": "",
   "title": "SLO & Error Budget",
   "uid": "slo-dashboard",
-  "version": 1
+  "version": 2,
+  "weekStart": ""
 }
