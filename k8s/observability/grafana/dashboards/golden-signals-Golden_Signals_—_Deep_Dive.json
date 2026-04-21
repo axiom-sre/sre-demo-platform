@@ -109,8 +109,10 @@
           "datasource": {
             "uid": "prometheus"
           },
-          "expr": "sum by (service) (rate(traces_spanmetrics_calls_total[5m]))",
+          "editorMode": "code",
+          "expr": "sum by (service) (rate(traces_spanmetrics_calls_total[1m]))",
           "legendFormat": "{{service}}",
+          "range": true,
           "refId": "A"
         }
       ],
@@ -209,8 +211,10 @@
           "datasource": {
             "uid": "prometheus"
           },
-          "expr": "sum by (service) (rate(traces_spanmetrics_calls_total{status_code=\"STATUS_CODE_ERROR\"}[5m])) / sum by (service) (rate(traces_spanmetrics_calls_total[5m]))",
+          "editorMode": "code",
+          "expr": "sum by (service) (rate(traces_spanmetrics_calls_total{status_code=\"STATUS_CODE_ERROR\"}[1m])) / sum by (service) (rate(traces_spanmetrics_calls_total[1m]))",
           "legendFormat": "{{service}}",
+          "range": true,
           "refId": "A"
         }
       ],
@@ -971,6 +975,6 @@
   "timezone": "",
   "title": "Golden Signals \u2014 Deep Dive",
   "uid": "golden-signals",
-  "version": 3,
+  "version": 5,
   "weekStart": ""
 }
