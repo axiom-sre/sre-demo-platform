@@ -670,8 +670,10 @@
           "datasource": {
             "uid": "prometheus"
           },
-          "expr": "sum by (service) (rate(traces_spanmetrics_calls_total[2m]))",
+          "editorMode": "code",
+          "expr": "sum by (service) (rate(traces_spanmetrics_calls_total[1m]))",
           "legendFormat": "{{service}}",
+          "range": true,
           "refId": "A"
         }
       ],
@@ -771,8 +773,10 @@
           "datasource": {
             "uid": "prometheus"
           },
-          "expr": "sum by (service) (rate(traces_spanmetrics_calls_total{status_code=\"STATUS_CODE_ERROR\"}[2m])) / sum by (service) (rate(traces_spanmetrics_calls_total[2m]))",
+          "editorMode": "code",
+          "expr": "sum by (service) (rate(traces_spanmetrics_calls_total{status_code=\"STATUS_CODE_ERROR\"}[1m])) / sum by (service) (rate(traces_spanmetrics_calls_total[1m]))",
           "legendFormat": "{{service}}",
+          "range": true,
           "refId": "A"
         }
       ],
@@ -868,16 +872,20 @@
           "datasource": {
             "uid": "prometheus"
           },
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(traces_spanmetrics_latency_bucket{service=\"frontend\"}[2m])))",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(traces_spanmetrics_latency_bucket{service=\"frontend\"}[1m])))",
           "legendFormat": "p90",
+          "range": true,
           "refId": "A"
         },
         {
           "datasource": {
             "uid": "prometheus"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(traces_spanmetrics_latency_bucket{service=\"frontend\"}[2m])))",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(traces_spanmetrics_latency_bucket{service=\"frontend\"}[1m])))",
           "legendFormat": "p95",
+          "range": true,
           "refId": "B"
         },
         {
@@ -1199,14 +1207,18 @@
         "defaults": {
           "custom": {
             "align": "center",
-            "displayMode": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
             "inspect": false
           },
+          "mappings": [],
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
-                "color": "green"
+                "color": "green",
+                "value": null
               }
             ]
           }
@@ -1232,7 +1244,8 @@
                   "mode": "absolute",
                   "steps": [
                     {
-                      "color": "green"
+                      "color": "green",
+                      "value": null
                     },
                     {
                       "color": "yellow",
@@ -1244,10 +1257,6 @@
                     }
                   ]
                 }
-              },
-              {
-                "id": "custom.displayMode",
-                "value": "color-background"
               }
             ]
           },
@@ -1287,7 +1296,8 @@
                   "mode": "absolute",
                   "steps": [
                     {
-                      "color": "green"
+                      "color": "green",
+                      "value": null
                     },
                     {
                       "color": "yellow",
@@ -1299,10 +1309,6 @@
                     }
                   ]
                 }
-              },
-              {
-                "id": "custom.displayMode",
-                "value": "color-background"
               }
             ]
           },
@@ -1317,16 +1323,13 @@
                 "value": "short"
               },
               {
-                "id": "custom.displayMode",
-                "value": "color-background"
-              },
-              {
                 "id": "thresholds",
                 "value": {
                   "mode": "absolute",
                   "steps": [
                     {
-                      "color": "red"
+                      "color": "red",
+                      "value": null
                     },
                     {
                       "color": "yellow",
@@ -1362,6 +1365,7 @@
         },
         "showHeader": true
       },
+      "pluginVersion": "11.1.0",
       "targets": [
         {
           "datasource": {
@@ -1442,6 +1446,7 @@
         "dedupStrategy": "none",
         "enableLogDetails": true,
         "prettifyLogMessage": false,
+        "showCommonLabels": false,
         "showLabels": true,
         "showTime": true,
         "sortOrder": "Descending",
@@ -1479,6 +1484,6 @@
   "timezone": "",
   "title": "SRE Command Center",
   "uid": "command-center",
-  "version": 2,
+  "version": 4,
   "weekStart": ""
 }
