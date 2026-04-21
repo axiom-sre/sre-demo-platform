@@ -109,10 +109,8 @@
           "datasource": {
             "uid": "prometheus"
           },
-          "editorMode": "code",
-          "expr": "sum by (service) (rate(traces_spanmetrics_calls_total[1m]))",
+          "expr": "sum by (service) (rate(traces_spanmetrics_calls_total[5m]))",
           "legendFormat": "{{service}}",
-          "range": true,
           "refId": "A"
         }
       ],
@@ -306,10 +304,8 @@
           "datasource": {
             "uid": "prometheus"
           },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.90, sum by (le, service) (rate(traces_spanmetrics_latency_bucket[1m])))",
+          "expr": "histogram_quantile(0.90, sum by (le, service) (rate(traces_spanmetrics_latency_bucket[5m])))",
           "legendFormat": "p90 {{service}}",
-          "range": true,
           "refId": "A"
         }
       ],
@@ -407,10 +403,8 @@
           "datasource": {
             "uid": "prometheus"
           },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, service) (rate(traces_spanmetrics_latency_bucket[1m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, service) (rate(traces_spanmetrics_latency_bucket[5m])))",
           "legendFormat": "p95 {{service}}",
-          "range": true,
           "refId": "A"
         }
       ],
@@ -508,10 +502,8 @@
           "datasource": {
             "uid": "prometheus"
           },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, service) (rate(traces_spanmetrics_latency_bucket[1m])))",
+          "expr": "histogram_quantile(0.99, sum by (le, service) (rate(traces_spanmetrics_latency_bucket[5m])))",
           "legendFormat": "p99 {{service}}",
-          "range": true,
           "refId": "A"
         }
       ],
@@ -579,7 +571,7 @@
               }
             ]
           },
-          "unit": "percentunit"
+          "unit": "percent"
         },
         "overrides": []
       },
@@ -610,8 +602,10 @@
           "datasource": {
             "uid": "prometheus"
           },
-          "expr": "sum by (pod) (\n  rate(container_cpu_cfs_throttled_seconds_total{namespace=\"boutique\",container!=\"\",container!=\"POD\"}[2m])\n) / sum by (pod) (\n  rate(container_cpu_cfs_periods_total{namespace=\"boutique\",container!=\"\",container!=\"POD\"}[2m])\n)",
+          "editorMode": "code",
+          "expr": "sum by (pod) (\n  rate(container_cpu_cfs_throttled_seconds_total{namespace=\"boutique\",container!=\"\",container!=\"POD\"}[2m])\n) / sum by (pod) (\n  rate(container_cpu_cfs_periods_total{namespace=\"boutique\",container!=\"\",container!=\"POD\"}[1m])\n)",
           "legendFormat": "{{pod}}",
+          "range": true,
           "refId": "A"
         }
       ],
