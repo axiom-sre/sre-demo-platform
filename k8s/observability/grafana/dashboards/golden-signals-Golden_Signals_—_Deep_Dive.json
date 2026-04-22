@@ -161,7 +161,7 @@
               "mode": "dashed+area"
             }
           },
-          "decimals": 3,
+          "decimals": 2,
           "fieldMinMax": false,
           "mappings": [],
           "min": 0,
@@ -974,13 +974,13 @@
     "list": []
   },
   "time": {
-    "from": "now-15m",
+    "from": "now-30m",
     "to": "now"
   },
   "timepicker": {},
   "timezone": "",
   "title": "Golden Signals \u2014 Deep Dive",
   "uid": "golden-signals",
-  "version": 20,
+  "version": 22,
   "weekStart": ""
 }

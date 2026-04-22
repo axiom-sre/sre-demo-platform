@@ -351,7 +351,7 @@
         ]
       },
       "gridPos": {
-        "h": 6,
+        "h": 5,
         "w": 24,
         "x": 0,
         "y": 7
@@ -461,7 +461,7 @@
         "h": 10,
         "w": 12,
         "x": 0,
-        "y": 13
+        "y": 12
       },
       "id": 1,
       "options": {
@@ -561,7 +561,7 @@
         "h": 10,
         "w": 12,
         "x": 12,
-        "y": 13
+        "y": 12
       },
       "id": 2,
       "options": {
@@ -661,7 +661,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 23
+        "y": 22
       },
       "id": 10,
       "options": {
@@ -762,7 +762,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 23
+        "y": 22
       },
       "id": 11,
       "options": {
@@ -856,15 +856,21 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 32
+        "y": 31
       },
       "id": 42,
       "options": {
         "legend": {
-          "calcs": [],
-          "displayMode": "list",
+          "calcs": [
+            "lastNotNull",
+            "max",
+            "firstNotNull"
+          ],
+          "displayMode": "table",
           "placement": "bottom",
-          "showLegend": true
+          "showLegend": true,
+          "sortBy": "Last *",
+          "sortDesc": true
         },
         "tooltip": {
           "mode": "single",
@@ -952,13 +958,17 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 32
+        "y": 31
       },
       "id": 43,
       "options": {
         "legend": {
-          "calcs": [],
-          "displayMode": "list",
+          "calcs": [
+            "lastNotNull",
+            "max",
+            "firstNotNull"
+          ],
+          "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
         },
@@ -1026,7 +1036,7 @@
         "h": 11,
         "w": 24,
         "x": 0,
-        "y": 41
+        "y": 40
       },
       "id": 44,
       "options": {
@@ -1119,7 +1129,7 @@
         "h": 10,
         "w": 24,
         "x": 0,
-        "y": 52
+        "y": 51
       },
       "id": 30,
       "options": {
@@ -1137,7 +1147,7 @@
         },
         "showPercentChange": false,
         "text": {
-          "titleSize": 12,
+          "titleSize": 10,
           "valueSize": 40
         },
         "textMode": "value_and_name",
@@ -1225,7 +1235,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 62
+        "y": 61
       },
       "id": 40,
       "options": {
@@ -1326,7 +1336,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 62
+        "y": 61
       },
       "id": 41,
       "options": {
@@ -1439,7 +1449,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 69
+        "y": 68
       },
       "id": 22,
       "options": {
@@ -1498,6 +1508,6 @@
   "timezone": "",
   "title": "Platform & HPA",
   "uid": "platform-stats",
-  "version": 28,
+  "version": 30,
   "weekStart": ""
 }
