@@ -830,6 +830,7 @@
             }
           },
           "mappings": [],
+          "min": 0,
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -848,7 +849,7 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 9,
+        "h": 8,
         "w": 24,
         "x": 0,
         "y": 16
@@ -876,7 +877,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(traces_spanmetrics_latency_bucket{service=\"frontend\"}[1m])))",
+          "expr": "histogram_quantile(0.90, sum by (le) (rate(traces_spanmetrics_latency_bucket{service=\"frontend\"}[1m])))",
           "legendFormat": "p90",
           "range": true,
           "refId": "A"
@@ -898,6 +899,19 @@
           "expr": "histogram_quantile(0.99, sum by (le) (rate(traces_spanmetrics_latency_bucket{service=\"frontend\"}[2m])))",
           "legendFormat": "p99",
           "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(traces_spanmetrics_latency_bucket{service=\"frontend\"}[1m])))",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "p50",
+          "range": true,
+          "refId": "D"
         }
       ],
       "title": "p90 / p95 / p99 Latency \u2014 Frontend",
@@ -1149,7 +1163,7 @@
         "h": 6,
         "w": 24,
         "x": 0,
-        "y": 25
+        "y": 24
       },
       "id": 40,
       "options": {
@@ -1225,7 +1239,7 @@
         "h": 11,
         "w": 24,
         "x": 0,
-        "y": 31
+        "y": 30
       },
       "id": 31,
       "options": {
@@ -1424,7 +1438,7 @@
         "h": 10,
         "w": 24,
         "x": 0,
-        "y": 42
+        "y": 41
       },
       "id": 50,
       "options": {
@@ -1513,7 +1527,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 52
+        "y": 51
       },
       "id": 60,
       "options": {
@@ -1558,6 +1572,6 @@
   "timezone": "",
   "title": "SRE Command Center",
   "uid": "command-center",
-  "version": 35,
+  "version": 37,
   "weekStart": ""
 }

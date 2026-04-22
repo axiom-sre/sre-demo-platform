@@ -417,7 +417,7 @@
         ]
       },
       "gridPos": {
-        "h": 10,
+        "h": 9,
         "w": 24,
         "x": 0,
         "y": 5
@@ -599,10 +599,10 @@
         ]
       },
       "gridPos": {
-        "h": 10,
+        "h": 9,
         "w": 24,
         "x": 0,
-        "y": 15
+        "y": 14
       },
       "id": 11,
       "options": {
@@ -753,10 +753,10 @@
         ]
       },
       "gridPos": {
-        "h": 10,
+        "h": 9,
         "w": 24,
         "x": 0,
-        "y": 25
+        "y": 23
       },
       "id": 20,
       "options": {
@@ -823,6 +823,6 @@
   "timezone": "",
   "title": "SLO & Error Budget",
   "uid": "slo-dashboard",
-  "version": 10,
+  "version": 11,
   "weekStart": ""
 }
