@@ -345,7 +345,7 @@
       },
       "gridPos": {
         "h": 10,
-        "w": 23,
+        "w": 24,
         "x": 0,
         "y": 0
       },
@@ -423,7 +423,7 @@
         ]
       },
       "gridPos": {
-        "h": 5,
+        "h": 6,
         "w": 24,
         "x": 0,
         "y": 10
@@ -533,7 +533,7 @@
         "h": 10,
         "w": 12,
         "x": 0,
-        "y": 15
+        "y": 16
       },
       "id": 1,
       "options": {
@@ -633,7 +633,7 @@
         "h": 10,
         "w": 12,
         "x": 12,
-        "y": 15
+        "y": 16
       },
       "id": 2,
       "options": {
@@ -733,7 +733,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 25
+        "y": 26
       },
       "id": 10,
       "options": {
@@ -834,7 +834,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 25
+        "y": 26
       },
       "id": 11,
       "options": {
@@ -928,7 +928,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 34
+        "y": 35
       },
       "id": 42,
       "options": {
@@ -942,7 +942,7 @@
           "placement": "bottom",
           "showLegend": true,
           "sortBy": "Last *",
-          "sortDesc": true
+          "sortDesc": false
         },
         "tooltip": {
           "mode": "single",
@@ -1030,7 +1030,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 34
+        "y": 35
       },
       "id": 43,
       "options": {
@@ -1108,7 +1108,7 @@
         "h": 11,
         "w": 24,
         "x": 0,
-        "y": 43
+        "y": 44
       },
       "id": 44,
       "options": {
@@ -1126,7 +1126,7 @@
         },
         "showPercentChange": false,
         "text": {
-          "titleSize": 14,
+          "titleSize": 12,
           "valueSize": 60
         },
         "textMode": "auto",
@@ -1198,10 +1198,10 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 10,
+        "h": 12,
         "w": 24,
         "x": 0,
-        "y": 54
+        "y": 55
       },
       "id": 30,
       "options": {
@@ -1307,7 +1307,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 64
+        "y": 67
       },
       "id": 40,
       "options": {
@@ -1408,7 +1408,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 64
+        "y": 67
       },
       "id": 41,
       "options": {
@@ -1521,7 +1521,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 71
+        "y": 74
       },
       "id": 22,
       "options": {
@@ -1580,6 +1580,6 @@
   "timezone": "",
   "title": "Platform & HPA",
   "uid": "platform-stats",
-  "version": 32,
+  "version": 36,
   "weekStart": ""
 }
