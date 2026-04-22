@@ -39,7 +39,7 @@
             "axisPlacement": "auto",
             "barAlignment": 0,
             "drawStyle": "line",
-            "fillOpacity": 8,
+            "fillOpacity": 3,
             "gradientMode": "none",
             "hideFrom": {
               "legend": false,
@@ -48,7 +48,10 @@
             },
             "insertNulls": false,
             "lineInterpolation": "smooth",
-            "lineWidth": 2,
+            "lineStyle": {
+              "fill": "solid"
+            },
+            "lineWidth": 3,
             "pointSize": 5,
             "scaleDistribution": {
               "type": "linear"
@@ -109,8 +112,10 @@
           "datasource": {
             "uid": "prometheus"
           },
-          "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{namespace=\"boutique\",container!=\"\",container!=\"POD\"}[2m])) * 1000",
+          "editorMode": "code",
+          "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{namespace=\"boutique\",container!=\"\",container!=\"POD\"}[1m])) * 1000",
           "legendFormat": "{{pod}}",
+          "range": true,
           "refId": "A"
         }
       ],
@@ -135,8 +140,8 @@
             "axisPlacement": "auto",
             "barAlignment": 0,
             "drawStyle": "line",
-            "fillOpacity": 8,
-            "gradientMode": "none",
+            "fillOpacity": 3,
+            "gradientMode": "hue",
             "hideFrom": {
               "legend": false,
               "tooltip": false,
@@ -144,7 +149,7 @@
             },
             "insertNulls": false,
             "lineInterpolation": "smooth",
-            "lineWidth": 2,
+            "lineWidth": 3,
             "pointSize": 5,
             "scaleDistribution": {
               "type": "linear"
@@ -231,8 +236,8 @@
             "axisPlacement": "auto",
             "barAlignment": 0,
             "drawStyle": "line",
-            "fillOpacity": 8,
-            "gradientMode": "none",
+            "fillOpacity": 3,
+            "gradientMode": "hue",
             "hideFrom": {
               "legend": false,
               "tooltip": false,
@@ -240,7 +245,7 @@
             },
             "insertNulls": false,
             "lineInterpolation": "smooth",
-            "lineWidth": 2,
+            "lineWidth": 3,
             "pointSize": 5,
             "scaleDistribution": {
               "type": "linear"
@@ -330,8 +335,8 @@
             "axisPlacement": "auto",
             "barAlignment": 0,
             "drawStyle": "line",
-            "fillOpacity": 8,
-            "gradientMode": "none",
+            "fillOpacity": 6,
+            "gradientMode": "hue",
             "hideFrom": {
               "legend": false,
               "tooltip": false,
@@ -339,7 +344,7 @@
             },
             "insertNulls": false,
             "lineInterpolation": "smooth",
-            "lineWidth": 2,
+            "lineWidth": 3,
             "pointSize": 5,
             "scaleDistribution": {
               "type": "linear"
@@ -561,7 +566,7 @@
             "properties": [
               {
                 "id": "max",
-                "value": 6
+                "value": 10
               },
               {
                 "id": "min",
@@ -578,11 +583,11 @@
                     },
                     {
                       "color": "#EAB839",
-                      "value": 4
+                      "value": 7
                     },
                     {
                       "color": "red",
-                      "value": 5
+                      "value": 9
                     }
                   ]
                 }
@@ -708,39 +713,7 @@
       "fieldConfig": {
         "defaults": {
           "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "stepAfter",
-            "lineWidth": 2,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
+            "mode": "thresholds"
           },
           "decimals": 0,
           "mappings": [],
@@ -766,47 +739,35 @@
               "id": "byRegexp",
               "options": "desired.*"
             },
-            "properties": [
-              {
-                "id": "custom.lineStyle",
-                "value": {
-                  "dash": [
-                    6,
-                    3
-                  ],
-                  "fill": "dash"
-                }
-              },
-              {
-                "id": "custom.lineWidth",
-                "value": 1
-              }
-            ]
+            "properties": []
           }
         ]
       },
       "gridPos": {
-        "h": 9,
+        "h": 12,
         "w": 24,
         "x": 0,
         "y": 26
       },
       "id": 21,
       "options": {
-        "legend": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
           "calcs": [
-            "lastNotNull",
-            "max"
+            "lastNotNull"
           ],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
+          "fields": "",
+          "values": false
         },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
       },
+      "pluginVersion": "11.1.0",
       "targets": [
         {
           "datasource": {
@@ -826,7 +787,7 @@
         }
       ],
       "title": "HPA Scaling History \u2014 current vs desired replicas",
-      "type": "timeseries"
+      "type": "stat"
     },
     {
       "datasource": {
@@ -877,7 +838,8 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green"
+                "color": "green",
+                "value": null
               },
               {
                 "color": "red",
@@ -893,7 +855,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 35
+        "y": 38
       },
       "id": 22,
       "options": {
@@ -958,7 +920,8 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green"
+                "color": "green",
+                "value": null
               },
               {
                 "color": "yellow",
@@ -975,17 +938,17 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 5,
+        "h": 10,
         "w": 24,
         "x": 0,
-        "y": 44
+        "y": 47
       },
       "id": 30,
       "options": {
         "colorMode": "background",
-        "graphMode": "none",
+        "graphMode": "area",
         "justifyMode": "center",
-        "orientation": "horizontal",
+        "orientation": "auto",
         "percentChangeColorMode": "standard",
         "reduceOptions": {
           "calcs": [
@@ -995,6 +958,10 @@
           "values": false
         },
         "showPercentChange": false,
+        "text": {
+          "titleSize": 12,
+          "valueSize": 40
+        },
         "textMode": "value_and_name",
         "wideLayout": true
       },
@@ -1063,7 +1030,8 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green"
+                "color": "green",
+                "value": null
               },
               {
                 "color": "red",
@@ -1079,7 +1047,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 49
+        "y": 57
       },
       "id": 40,
       "options": {
@@ -1159,7 +1127,8 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green"
+                "color": "green",
+                "value": null
               },
               {
                 "color": "yellow",
@@ -1179,7 +1148,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 49
+        "y": 57
       },
       "id": 41,
       "options": {
@@ -1239,13 +1208,13 @@
     "list": []
   },
   "time": {
-    "from": "now-15m",
+    "from": "now-1h",
     "to": "now"
   },
   "timepicker": {},
   "timezone": "",
   "title": "Platform & HPA",
   "uid": "platform-stats",
-  "version": 5,
+  "version": 15,
   "weekStart": ""
 }
