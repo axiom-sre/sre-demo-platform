@@ -39,7 +39,7 @@
             "axisPlacement": "auto",
             "barAlignment": 0,
             "drawStyle": "line",
-            "fillOpacity": 3,
+            "fillOpacity": 2,
             "gradientMode": "none",
             "hideFrom": {
               "legend": false,
@@ -51,7 +51,7 @@
             "lineStyle": {
               "fill": "solid"
             },
-            "lineWidth": 3,
+            "lineWidth": 2,
             "pointSize": 5,
             "scaleDistribution": {
               "type": "linear"
@@ -140,7 +140,7 @@
             "axisPlacement": "auto",
             "barAlignment": 0,
             "drawStyle": "line",
-            "fillOpacity": 3,
+            "fillOpacity": 2,
             "gradientMode": "hue",
             "hideFrom": {
               "legend": false,
@@ -149,7 +149,7 @@
             },
             "insertNulls": false,
             "lineInterpolation": "smooth",
-            "lineWidth": 3,
+            "lineWidth": 2,
             "pointSize": 5,
             "scaleDistribution": {
               "type": "linear"
@@ -236,7 +236,7 @@
             "axisPlacement": "auto",
             "barAlignment": 0,
             "drawStyle": "line",
-            "fillOpacity": 3,
+            "fillOpacity": 2,
             "gradientMode": "hue",
             "hideFrom": {
               "legend": false,
@@ -245,7 +245,7 @@
             },
             "insertNulls": false,
             "lineInterpolation": "smooth",
-            "lineWidth": 3,
+            "lineWidth": 2,
             "pointSize": 5,
             "scaleDistribution": {
               "type": "linear"
@@ -335,7 +335,7 @@
             "axisPlacement": "auto",
             "barAlignment": 0,
             "drawStyle": "line",
-            "fillOpacity": 6,
+            "fillOpacity": 1,
             "gradientMode": "hue",
             "hideFrom": {
               "legend": false,
@@ -344,7 +344,7 @@
             },
             "insertNulls": false,
             "lineInterpolation": "smooth",
-            "lineWidth": 3,
+            "lineWidth": 1,
             "pointSize": 5,
             "scaleDistribution": {
               "type": "linear"
@@ -371,7 +371,7 @@
               },
               {
                 "color": "yellow",
-                "value": 0.7
+                "value": 0.65
               },
               {
                 "color": "red",
@@ -416,6 +416,197 @@
         }
       ],
       "title": "Memory Saturation % of Limit \u2014 boutique (red = OOMKill risk)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 2,
+            "gradientMode": "hue",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 18
+      },
+      "id": 42,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "sum by (container) (\n  rate(container_cpu_usage_seconds_total{\n    namespace=\"boutique\",\n    container!=\"\",\n    container!=\"POD\"\n  }[2m])\n) * 1000",
+          "instant": false,
+          "legendFormat": "{{label_name}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Avg CPU per service (millicores)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 18
+      },
+      "id": 43,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (container) (\n  rate(container_cpu_usage_seconds_total{\n    namespace=\"boutique\",\n    container!=\"\",\n    container!=\"POD\"\n  }[2m])\n)\n/\nsum by (container) (\n  kube_pod_container_resource_requests{\n    namespace=\"boutique\",\n    resource=\"cpu\",\n    container!=\"\"\n  }\n) * 100",
+          "instant": false,
+          "legendFormat": "__auto",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Avg CPU utilisation % per service (matches HPA % view)",
       "type": "timeseries"
     },
     {
@@ -566,7 +757,7 @@
             "properties": [
               {
                 "id": "max",
-                "value": 10
+                "value": 12
               },
               {
                 "id": "min",
@@ -583,11 +774,11 @@
                     },
                     {
                       "color": "#EAB839",
-                      "value": 7
+                      "value": 8
                     },
                     {
                       "color": "red",
-                      "value": 9
+                      "value": 11
                     }
                   ]
                 }
@@ -602,7 +793,7 @@
             "properties": [
               {
                 "id": "max",
-                "value": 6
+                "value": 8
               },
               {
                 "id": "min",
@@ -619,11 +810,11 @@
                     },
                     {
                       "color": "#EAB839",
-                      "value": 4
+                      "value": 5
                     },
                     {
                       "color": "red",
-                      "value": 5
+                      "value": 7
                     }
                   ]
                 }
@@ -638,7 +829,7 @@
             "properties": [
               {
                 "id": "max",
-                "value": 5
+                "value": 8
               },
               {
                 "id": "min",
@@ -655,11 +846,11 @@
                     },
                     {
                       "color": "#EAB839",
-                      "value": 3
+                      "value": 6
                     },
                     {
                       "color": "red",
-                      "value": 4
+                      "value": 7
                     }
                   ]
                 }
@@ -669,10 +860,10 @@
         ]
       },
       "gridPos": {
-        "h": 8,
-        "w": 24,
+        "h": 6,
+        "w": 23,
         "x": 0,
-        "y": 18
+        "y": 27
       },
       "id": 20,
       "options": {
@@ -744,10 +935,10 @@
         ]
       },
       "gridPos": {
-        "h": 12,
+        "h": 11,
         "w": 24,
         "x": 0,
-        "y": 26
+        "y": 33
       },
       "id": 21,
       "options": {
@@ -764,6 +955,10 @@
           "values": false
         },
         "showPercentChange": false,
+        "text": {
+          "titleSize": 14,
+          "valueSize": 60
+        },
         "textMode": "auto",
         "wideLayout": true
       },
@@ -855,7 +1050,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 38
+        "y": 44
       },
       "id": 22,
       "options": {
@@ -941,13 +1136,13 @@
         "h": 10,
         "w": 24,
         "x": 0,
-        "y": 47
+        "y": 53
       },
       "id": 30,
       "options": {
         "colorMode": "background",
         "graphMode": "area",
-        "justifyMode": "center",
+        "justifyMode": "auto",
         "orientation": "auto",
         "percentChangeColorMode": "standard",
         "reduceOptions": {
@@ -1047,7 +1242,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 57
+        "y": 63
       },
       "id": 40,
       "options": {
@@ -1148,7 +1343,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 57
+        "y": 63
       },
       "id": 41,
       "options": {
@@ -1208,13 +1403,13 @@
     "list": []
   },
   "time": {
-    "from": "now-1h",
+    "from": "now-30m",
     "to": "now"
   },
   "timepicker": {},
   "timezone": "",
   "title": "Platform & HPA",
   "uid": "platform-stats",
-  "version": 15,
+  "version": 23,
   "weekStart": ""
 }

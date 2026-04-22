@@ -971,13 +971,13 @@
     "list": []
   },
   "time": {
-    "from": "now-1h",
+    "from": "now-30m",
     "to": "now"
   },
   "timepicker": {},
   "timezone": "",
   "title": "Golden Signals \u2014 Deep Dive",
   "uid": "golden-signals",
-  "version": 15,
+  "version": 16,
   "weekStart": ""
 }

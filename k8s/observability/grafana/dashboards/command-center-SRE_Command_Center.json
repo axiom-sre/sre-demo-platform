@@ -1043,7 +1043,7 @@
             "properties": [
               {
                 "id": "max",
-                "value": 10
+                "value": 12
               },
               {
                 "id": "min",
@@ -1060,11 +1060,11 @@
                     },
                     {
                       "color": "#EAB839",
-                      "value": 7
+                      "value": 8
                     },
                     {
                       "color": "red",
-                      "value": 9
+                      "value": 11
                     }
                   ]
                 }
@@ -1115,7 +1115,7 @@
             "properties": [
               {
                 "id": "max",
-                "value": 6
+                "value": 8
               },
               {
                 "id": "min",
@@ -1132,11 +1132,11 @@
                     },
                     {
                       "color": "#EAB839",
-                      "value": 4
+                      "value": 6
                     },
                     {
                       "color": "red",
-                      "value": 5
+                      "value": 7
                     }
                   ]
                 }
@@ -1540,7 +1540,7 @@
       "type": "logs"
     }
   ],
-  "refresh": "auto",
+  "refresh": "10s",
   "schemaVersion": 39,
   "tags": [
     "command-center",
@@ -1551,13 +1551,13 @@
     "list": []
   },
   "time": {
-    "from": "now-5m",
+    "from": "now-30m",
     "to": "now"
   },
   "timepicker": {},
   "timezone": "",
   "title": "SRE Command Center",
   "uid": "command-center",
-  "version": 33,
+  "version": 35,
   "weekStart": ""
 }
