@@ -1,51 +1,47 @@
-# boutique/hpa.yaml — Holy Grail Edition
+# boutique/hpa.yaml — Holy Grail Edition v3
 # =============================================================================
-# CPU BUDGET MATH — M5 Pro 8 vCPU node
-# =============================================================================
+# KEY CHANGES vs v2:
 #
-# Node CPU budget: 8000m
-#   kube-system reserved:     ~400m
-#   observability (requests):  2100m  (alloy 500 + prom 300 + tempo 300 + loki 200 + grafana 200 + infra 600)
-#   Available for boutique:   ~5500m
+# [CURRENCY maxReplicas: 6 → 10]
+#   Root cause observed: at 250 VU, currency hit maxReplicas (6) within 5
+#   minutes and pinned there. Every page render calls currency — home + each
+#   product page. At 250 VU × ~3 currency calls/session = ~150 req/s on
+#   currency. 6 pods cannot sustain this. 10 can.
+#   10 × 15m = 150m requests scheduled — trivial node impact.
 #
-# Boutique FIXED pods (no HPA):
-#   redis 100 + email 50 + payment 100 + shipping 100 + recommend 200 + currency 200×2 + adservice 200
-#   = ~1150m fixed
+# [FRONTEND dual-metric HPA: CPU + memory]
+#   Root cause observed: frontend CPU was 1m at idle and never exceeded
+#   ~15m even at 250 VU. Go frontend proxies gRPC — it is not compute-bound.
+#   The CPU trigger (25m) will never fire at realistic load.
 #
-# Boutique HPA pods (at MAX replicas):
-#   frontend:     12 × 500m = 6000m  ← LIMIT: see note below
-#   productcatalog: 8 × 250m = 2000m
-#   cart:          5 × 500m = 2500m  ← reduced from 8 (previous root cause)
-#   checkout:      6 × 200m = 1200m
-#   currency:      6 × 100m =  600m
-#   Total max:              = 12300m (ALL HPAs at max simultaneously)
+#   Fix: add memory as primary HPA signal.
+#   Memory grows linearly with VU count (goroutine stacks, HTTP buffers,
+#   template render cache). Observed: 27-72Mi idle. Estimated 90-120Mi at
+#   100 VU, 120-160Mi at 250 VU.
+#   Trigger: 70% × 128Mi request = 90Mi actual → fires ~100-150 VU. ✓
 #
-# NOTE: All HPAs hitting max simultaneously is physically impossible on this
-# node — the ResourceQuota (6 CPU requests for boutique) prevents it.
-# HPA fires based on per-service load, not all at once. In practice at 1000 VU
-# the realistic peak is: frontend 4-6 pods + cart 3-4 pods + others at min.
-# That's ~4500m requests — comfortably within the 5500m available.
+#   HPA uses OR logic: fires when EITHER metric exceeds threshold.
+#   CPU trigger kept as safety net for unexpected compute spikes.
+#   Memory trigger is the primary scaling signal for frontend.
 #
-# CARTSERVICE ROOT CAUSE (documented here for institutional memory):
-# Previous: maxReplicas=8 × 500m = 4000m requests for cart alone.
-# At 1000 VU, HPA scaled cart to max simultaneously with frontend scaling.
-# Combined requests exceeded node available CPU → scheduler couldn't place pods
-# → pods stuck Pending → HPA saw Pending pods as scaled → further evictions.
-# Fix: maxReplicas=5 (2500m max) + stabilizationWindowSeconds=120 (don't rush).
+# [ALL think() times in load scripts tightened to 1-2s]
+#   This is in the scripts, not here, but it matters for HPA:
+#   Looser think times → lower RPS → lower CPU/memory → HPA never fires.
+#   At think(1,2) avg 1.5s, 100 VU generates ~67 iterations/sec ≈ 100+ RPS.
+#   That's enough to push all services past their triggers.
 #
-# THRESHOLDS EXPLAINED:
-# averageUtilization is % of the REQUEST (not limit).
-# Formula: actual_CPU_threshold = request_millicores × (averageUtilization / 100)
-#
-#   frontend:    50% × 500m = 250m  — scale when each pod averages 250m
-#   productcat:  50% × 250m = 125m  — scale when CPU browsing starts
-#   recommend:   55% × 200m = 110m  — raised from 50% (Python import spike fix)
-#   cart:        60% × 500m = 300m  — raised from 55% (was 165m, too sensitive)
-#   checkout:    55% × 200m = 110m  — scale under checkout load
-#   currency:    60% × 100m =  60m  — lightweight, called every page render
+# NODE BUDGET — updated:
+#   currency max: 10 × 15m  = 150m  (was 6 × 15m = 90m)
+#   frontend max: 10 × 50m  = 500m  (unchanged)
+#   Total boutique at max HPA: ~1355m requests
+#   Available: ~6800m — still massive headroom.
 # =============================================================================
 
-# ── Frontend — highest traffic, scale aggressively ────────────────────────────
+# ── Frontend — Go proxy: dual-metric CPU + memory ────────────────────────────
+#
+# CPU trigger:    50% × 50m   = 25m   → safety net, unlikely to fire
+# Memory trigger: 70% × 128Mi = 90Mi  → PRIMARY signal, fires ~100-150 VU
+# HPA OR logic: whichever hits threshold first triggers scale.
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
@@ -57,7 +53,7 @@ spec:
     kind: Deployment
     name: frontend
   minReplicas: 2
-  maxReplicas: 10    # 10 × 500m = 5000m — within budget, leaves room for cart
+  maxReplicas: 10
   metrics:
     - type: Resource
       resource:
@@ -65,18 +61,24 @@ spec:
         target:
           type: Utilization
           averageUtilization: 50
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 70    # 70% × 128Mi = 90Mi — fires at real load
   behavior:
     scaleUp:
       stabilizationWindowSeconds: 30
       policies:
         - type: Pods
-          value: 3           # scale 3 pods at a time during ramp
+          value: 3
           periodSeconds: 30
     scaleDown:
-      stabilizationWindowSeconds: 300  # hold for 5min before scaling down
+      stabilizationWindowSeconds: 300
       policies:
         - type: Pods
-          value: 1           # release 1 pod per minute — smooth tail-off
+          value: 1
           periodSeconds: 60
 ---
 # ── Product Catalog — CPU-heavy on browse ─────────────────────────────────────
@@ -98,7 +100,7 @@ spec:
         name: cpu
         target:
           type: Utilization
-          averageUtilization: 50
+          averageUtilization: 50    # 50% × 30m = 15m actual trigger
   behavior:
     scaleUp:
       stabilizationWindowSeconds: 30
@@ -132,10 +134,10 @@ spec:
         name: cpu
         target:
           type: Utilization
-          averageUtilization: 55   # 55% × 200m = 110m. Avoids Python startup spikes.
+          averageUtilization: 55    # 55% × 25m = 14m. Python import spike avoidance.
   behavior:
     scaleUp:
-      stabilizationWindowSeconds: 45    # longer window — Python import CPU spike avoidance
+      stabilizationWindowSeconds: 45
       policies:
         - type: Pods
           value: 2
@@ -147,22 +149,14 @@ spec:
           value: 1
           periodSeconds: 60
 ---
-# ── Cart — THE critical service. Conservatively tuned. ────────────────────────
+# ── Cart — .NET, conservatively tuned ─────────────────────────────────────────
 #
-# maxReplicas: 5 (reduced from 8)
-# Reason: 5 × 500m = 2500m requests. With frontend at max (10 × 500m = 5000m)
-# the combined request budget is 7500m — still within node capacity.
-# 8 pods was mathematically impossible to schedule alongside full observability.
-#
-# stabilizationWindowSeconds (scaleUp): 60s — NOT 30s.
-# The k6 load profile ramps from 100→500→1000 VU over 3 minutes.
-# cartservice CPU spikes during .NET JIT warmup even at low VU counts.
-# A 60s window prevents the HPA from over-scaling during the ramp phase,
-# which would trigger cascading scheduling pressure before load is stable.
-#
-# averageUtilization: 60% (60% × 500m = 300m actual threshold)
-# Previously 55% × 300m = 165m — a single JIT-warmed gRPC connection hit this.
-# Now requires sustained 300m across ALL cart pods before scale fires.
+# stabilizationWindowSeconds scaleUp: 60s — DO NOT REDUCE.
+# .NET JIT warmup spikes CPU to 800-1200m on first requests per pod.
+# 60s window averages through the spike before deciding to scale.
+# Without this: JIT spike → HPA fires → new pod JIT spikes → cascade.
+# The +1 pod/60s policy means cart scales visibly slowly — this is by design
+# and should be narrated in demo as "conservative scale for stateful service".
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
@@ -174,20 +168,20 @@ spec:
     kind: Deployment
     name: cartservice
   minReplicas: 2
-  maxReplicas: 5    # CRITICAL: reduced from 8. See budget math above.
+  maxReplicas: 5
   metrics:
     - type: Resource
       resource:
         name: cpu
         target:
           type: Utilization
-          averageUtilization: 60
+          averageUtilization: 60    # 60% × 50m = 30m actual trigger
   behavior:
     scaleUp:
-      stabilizationWindowSeconds: 60    # longer than default — prevents JIT spike scale-out
+      stabilizationWindowSeconds: 60
       policies:
         - type: Pods
-          value: 1           # scale 1 pod at a time (conservative — cart is expensive)
+          value: 1
           periodSeconds: 60
     scaleDown:
       stabilizationWindowSeconds: 300
@@ -215,7 +209,7 @@ spec:
         name: cpu
         target:
           type: Utilization
-          averageUtilization: 55
+          averageUtilization: 55    # 55% × 25m = 14m actual trigger
   behavior:
     scaleUp:
       stabilizationWindowSeconds: 30
@@ -230,7 +224,17 @@ spec:
           value: 1
           periodSeconds: 60
 ---
-# ── Currency — lightweight, called every page render ──────────────────────────
+# ── Currency — every page render, maxReplicas bumped to 10 ────────────────────
+#
+# maxReplicas: 6 → 10
+# Observed at 250 VU: pinned at maxReplicas (6) within 5 minutes.
+# Currency is called on EVERY page render — not just checkout.
+# At 1000 VU: ~1000+ currency calls/sec. 10 pods handles it.
+# 10 × 15m = 150m scheduled requests — trivial scheduling overhead.
+#
+# In demo: currency maxing out and staying at 10 is a GOOD story —
+# "currency is our hottest service, it scales to max and holds there
+# because every single page render calls it". That's an SRE insight.
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
@@ -242,14 +246,14 @@ spec:
     kind: Deployment
     name: currencyservice
   minReplicas: 2
-  maxReplicas: 6
+  maxReplicas: 10    # was 6 — pinned at 250 VU, needs headroom for 1000 VU
   metrics:
     - type: Resource
       resource:
         name: cpu
         target:
           type: Utilization
-          averageUtilization: 60
+          averageUtilization: 60    # 60% × 15m = 9m actual — fires earliest
   behavior:
     scaleUp:
       stabilizationWindowSeconds: 30

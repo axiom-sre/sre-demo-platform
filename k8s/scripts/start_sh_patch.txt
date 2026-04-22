@@ -1,0 +1,27 @@
+# ── Add this block to start.sh BEFORE section 6 (boutique application) ────────
+# Ensures the local Docker registry is running so the patched frontend image
+# is available to k8s. The registry bridges Docker daemon and k8s containerd.
+
+section "5b. Local registry (patched frontend)"
+if docker ps --format '{{.Names}}' | grep -q "^local-registry$"; then
+  info "Local registry already running ✓"
+else
+  info "Starting local registry on :5001..."
+  docker run -d -p 5001:5000 --name local-registry registry:2 2>/dev/null || \
+    docker start local-registry 2>/dev/null || true
+  sleep 2
+fi
+
+# Verify patched image is in registry
+if docker manifest inspect localhost:5001/boutique-frontend:arm64-v1 &>/dev/null 2>&1; then
+  info "Patched frontend image verified in registry ✓"
+else
+  warn "Patched frontend image not found in registry."
+  warn "Run: docker push localhost:5001/boutique-frontend:arm64-v1"
+  warn "If image is lost (reboot), rebuild:"
+  warn "  cd /tmp/boutique-patch && docker buildx build --platform linux/arm64 \\"
+  warn "    --build-arg TARGETARCH=arm64 --build-arg TARGETOS=linux \\"
+  warn "    --load -t boutique-frontend:arm64-v1 src/frontend/"
+  warn "  docker tag boutique-frontend:arm64-v1 localhost:5001/boutique-frontend:arm64-v1"
+  warn "  docker push localhost:5001/boutique-frontend:arm64-v1"
+fi

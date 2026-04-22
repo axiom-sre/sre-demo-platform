@@ -1,115 +1,101 @@
 /**
- * load-test_10vusers.js — SRE Demo Platform: Smoke Test (10 VU)
- * =============================================================================
- * Run this FIRST after every reboot to verify the stack is healthy before
- * running the 100 VU or 1000 VU tests. Expected runtime: ~6 minutes.
+ * load-test_10vusers.js — SRE Demo: Smoke Test (10 VU)
+ * ─────────────────────────────────────────────────────
+ * PURPOSE : First check after every reboot / nuke. ~6 min runtime.
+ * PASS    : 0% failures, p95 < 500ms, all 7 checks green.
+ * USAGE   : k6 run scripts/load-test_10vusers.js
  *
- * Pass criteria (all must be green):
- *   - <0.1% failure rate (not 0% — DNS hiccups happen; 0.1% is honest)
+ * TRAFFIC SHAPE:
+ *   50% Window Shoppers  — home + 2 product pages, leave
+ *   40% Cart Abandoners  — browse + add to cart, leave
+ *   10% Power Buyers     — full checkout flow
+ *
+ * WHAT TO WATCH:
+ *   - All 7 checks green
+ *   - 0% errors (threshold <0.1%)
  *   - p95 < 500ms
- *   - All check() assertions passing
- *
- * KEY CHANGES vs v2:
- *   - Sustained stage: 30m → 5m. "Smoke test" means quick validation,
- *     not a 30-minute soak. Use load-test_100vusers.js for soak testing.
- *   - BASE_URL default: localhost:8080 (LoadBalancer, reliable on Docker Desktop)
- *     with explicit comment explaining why not 30080.
- *   - timeout: 10s → 15s on smoke test — gives cold-start responses more room.
- *   - Added checkout flow (5% of VUs) to verify the full cart→checkout→payment
- *     path on every smoke run. Previously smoke only tested browse+cart.
- *
- * USAGE:
- *   k6 run scripts/load-test_10vusers.js
- *   k6 run --env BASE_URL=http://localhost:8080 scripts/load-test_10vusers.js
- * =============================================================================
+ *   - HPA stays at min replicas — smoke should NOT trigger scaling
  */
 
 import http from 'k6/http';
 import { sleep, check, group } from 'k6';
 
-// LoadBalancer :8080 is the reliable path on Docker Desktop.
-// NodePort :30080 is unreliable — Docker Desktop's VM network namespace
-// doesn't always bind NodePorts to macOS localhost after sleep/wake.
 const BASE = __ENV.BASE_URL || 'http://localhost:8080';
 
-const REQ_PARAMS = {
+const P = {
   timeout: '15s',
   tags: { test: '10vu-smoke' },
 };
 
-const PRODUCTS = ['OLJCESPC7Z', '66VCHSJNUP', '1YMWWN1N4O', '0PUK6V6EV0'];
+const PRODUCTS = [
+  'OLJCESPC7Z', '66VCHSJNUP', '1YMWWN1N4O', '0PUK6V6EV0', '2ZYFJ3GM2N',
+  'L9ECAV7KIM', 'LS4PSXUNUM', '9SIQT8TOJO', '6E92ZMYYFZ',
+];
 
 export const options = {
   stages: [
-    { duration: '30s', target: 10  },   // ramp up
-    { duration: '5m',  target: 10  },   // smoke window (was 30m — too long)
-    { duration: '30s', target: 0   },   // ramp down
+    { duration: '30s', target: 10 },
+    { duration: '5m',  target: 10 },
+    { duration: '30s', target: 0  },
   ],
   thresholds: {
-    http_req_failed:   ['rate<0.001'],   // <0.1% — honest smoke threshold
-    http_req_duration: ['p(95)<500'],    // fast with 10 VU
+    http_req_failed:   ['rate<0.001'],
+    http_req_duration: ['p(95)<500'],
   },
   summaryTrendStats: ['avg', 'min', 'med', 'max', 'p(90)', 'p(95)', 'p(99)'],
 };
 
+function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+function think(lo, hi) { sleep(Math.random() * (hi - lo) + lo); }
+
 export default function () {
-  group('Smoke Test', function () {
+  const persona = Math.random();
 
-    // ── Browse ────────────────────────────────────────────────────────────────
-    const home = http.get(`${BASE}/`, {
-      ...REQ_PARAMS,
-      tags: { ...REQ_PARAMS.tags, name: 'Home' },
-    });
-    check(home, {
-      'home: 200':          (r) => r.status === 200,
-      'home: has products': (r) => r.body && r.body.includes('product'),
-    });
-    sleep(2);
+  group('session', () => {
 
-    for (const pid of PRODUCTS.slice(0, 2)) {
-      const product = http.get(`${BASE}/product/${pid}`, {
-        ...REQ_PARAMS,
-        tags: { ...REQ_PARAMS.tags, name: 'ProductPage' },
+    const home = http.get(`${BASE}/`, { ...P, tags: { ...P.tags, name: 'Home' } });
+    check(home, { 'home: 200': r => r.status === 200 });
+    think(1, 2);
+
+    for (let i = 0; i < 2; i++) {
+      const prod = http.get(`${BASE}/product/${pick(PRODUCTS)}`,
+        { ...P, tags: { ...P.tags, name: 'ProductPage' } });
+      check(prod, {
+        'product: 200':       r => r.status === 200,
+        'product: has price': r => r.body && r.body.includes('$'),
       });
-      check(product, { 'product: 200': (r) => r.status === 200 });
-      sleep(1);
+      think(1, 2);
     }
 
-    // ── Cart ──────────────────────────────────────────────────────────────────
-    http.post(`${BASE}/cart`,
-      { product_id: PRODUCTS[0], quantity: '1' },
-      { ...REQ_PARAMS, tags: { ...REQ_PARAMS.tags, name: 'AddToCart' } }
-    );
+    if (persona >= 0.5) return;
 
-    const cart = http.get(`${BASE}/cart`, {
-      ...REQ_PARAMS,
-      tags: { ...REQ_PARAMS.tags, name: 'ViewCart' },
+    const add = http.post(`${BASE}/cart`,
+      { product_id: pick(PRODUCTS), quantity: '1' },
+      { ...P, tags: { ...P.tags, name: 'AddToCart' } });
+    check(add, { 'addToCart: 200 or 302': r => r.status === 200 || r.status === 302 });
+
+    const cart = http.get(`${BASE}/cart`, { ...P, tags: { ...P.tags, name: 'ViewCart' } });
+    check(cart, { 'viewCart: 200': r => r.status === 200 });
+    think(1, 2);
+
+    if (persona >= 0.1) return;
+
+    const co = http.post(`${BASE}/cart/checkout`, {
+      email:                        'sre-smoke@example.com',
+      street_address:               '1 Smoke Lane',
+      zip_code:                     '10001',
+      city:                         'SmokeCity',
+      state:                        'CA',
+      country:                      'US',
+      credit_card_number:           '4432801561520454',
+      credit_card_expiration_month: '1',
+      credit_card_expiration_year:  '2030',
+      credit_card_cvv:              '672',
+    }, { ...P, tags: { ...P.tags, name: 'Checkout' } });
+    check(co, {
+      'checkout: ok':     r => r.status === 200 || r.status === 302,
+      'checkout: no 5xx': r => r.status < 500,
     });
-    check(cart, { 'cart: 200': (r) => r.status === 200 });
-    sleep(2);
-
-    // ── Checkout (5% of VUs — verifies full payment path) ────────────────────
-    if (Math.random() < 0.05) {
-      const checkoutRes = http.post(`${BASE}/cart/checkout`, {
-        email:                        'smoke-test@example.com',
-        street_address:               '1 Smoke Test Lane',
-        zip_code:                     '10001',
-        city:                         'SmokeCity',
-        state:                        'CA',
-        country:                      'US',
-        credit_card_number:           '4432801561520454',
-        credit_card_expiration_month: '1',
-        credit_card_expiration_year:  '2030',
-        credit_card_cvv:              '672',
-      }, {
-        ...REQ_PARAMS,
-        tags: { ...REQ_PARAMS.tags, name: 'Checkout' },
-      });
-      check(checkoutRes, {
-        'checkout: ok':    (r) => r.status === 200 || r.status === 302,
-        'checkout: no 5xx': (r) => r.status < 500,
-      });
-      sleep(2);
-    }
+    think(1, 2);
   });
 }
