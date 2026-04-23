@@ -645,7 +645,7 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 12,
         "x": 0,
         "y": 7
@@ -660,7 +660,9 @@
           ],
           "displayMode": "table",
           "placement": "bottom",
-          "showLegend": true
+          "showLegend": true,
+          "sortBy": "Max",
+          "sortDesc": true
         },
         "tooltip": {
           "mode": "multi",
@@ -702,8 +704,8 @@
             "axisSoftMin": 0,
             "barAlignment": 0,
             "drawStyle": "line",
-            "fillOpacity": 5,
-            "gradientMode": "none",
+            "fillOpacity": 2,
+            "gradientMode": "hue",
             "hideFrom": {
               "legend": false,
               "tooltip": false,
@@ -737,11 +739,11 @@
               },
               {
                 "color": "yellow",
-                "value": 0.005
+                "value": 0.05
               },
               {
                 "color": "red",
-                "value": 0.02
+                "value": 0.1
               }
             ]
           },
@@ -750,7 +752,7 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 12,
         "x": 12,
         "y": 7
@@ -764,7 +766,9 @@
           ],
           "displayMode": "table",
           "placement": "bottom",
-          "showLegend": true
+          "showLegend": true,
+          "sortBy": "Count",
+          "sortDesc": true
         },
         "tooltip": {
           "mode": "multi",
@@ -852,7 +856,7 @@
         "h": 7,
         "w": 24,
         "x": 0,
-        "y": 15
+        "y": 16
       },
       "id": 30,
       "options": {
@@ -1023,7 +1027,7 @@
             "properties": [
               {
                 "id": "max",
-                "value": 6
+                "value": 8
               },
               {
                 "id": "min",
@@ -1040,11 +1044,11 @@
                     },
                     {
                       "color": "#EAB839",
-                      "value": 4
+                      "value": 6
                     },
                     {
                       "color": "red",
-                      "value": 5
+                      "value": 7
                     }
                   ]
                 }
@@ -1095,7 +1099,7 @@
             "properties": [
               {
                 "id": "max",
-                "value": 6
+                "value": 8
               },
               {
                 "id": "min",
@@ -1112,11 +1116,11 @@
                     },
                     {
                       "color": "#EAB839",
-                      "value": 4
+                      "value": 5
                     },
                     {
                       "color": "red",
-                      "value": 5
+                      "value": 7
                     }
                   ]
                 }
@@ -1237,7 +1241,7 @@
         "h": 10,
         "w": 24,
         "x": 0,
-        "y": 22
+        "y": 23
       },
       "id": 40,
       "options": {
@@ -1253,7 +1257,11 @@
         },
         "showThresholdLabels": true,
         "showThresholdMarkers": true,
-        "sizing": "auto"
+        "sizing": "auto",
+        "text": {
+          "titleSize": 15,
+          "valueSize": 40
+        }
       },
       "pluginVersion": "11.1.0",
       "targets": [
@@ -1313,7 +1321,7 @@
         "h": 11,
         "w": 24,
         "x": 0,
-        "y": 32
+        "y": 33
       },
       "id": 31,
       "options": {
@@ -1332,7 +1340,7 @@
         "showPercentChange": false,
         "text": {
           "titleSize": 12,
-          "valueSize": 60
+          "valueSize": 50
         },
         "textMode": "value_and_name",
         "wideLayout": true
@@ -1512,7 +1520,7 @@
         "h": 10,
         "w": 24,
         "x": 0,
-        "y": 43
+        "y": 44
       },
       "id": 50,
       "options": {
@@ -1601,7 +1609,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 53
+        "y": 54
       },
       "id": 60,
       "options": {
@@ -1628,7 +1636,7 @@
       "type": "logs"
     }
   ],
-  "refresh": "10s",
+  "refresh": "auto",
   "schemaVersion": 39,
   "tags": [
     "command-center",
@@ -1646,6 +1654,6 @@
   "timezone": "",
   "title": "SRE Command Center",
   "uid": "command-center",
-  "version": 43,
+  "version": 55,
   "weekStart": ""
 }

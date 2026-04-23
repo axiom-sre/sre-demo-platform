@@ -93,7 +93,8 @@
           "calcs": [
             "lastNotNull",
             "max",
-            "mean"
+            "mean",
+            "count"
           ],
           "displayMode": "table",
           "placement": "bottom",
@@ -161,7 +162,6 @@
               "mode": "dashed+area"
             }
           },
-          "decimals": 2,
           "fieldMinMax": false,
           "mappings": [],
           "thresholds": {
@@ -197,7 +197,8 @@
           "calcs": [
             "lastNotNull",
             "max",
-            "firstNotNull"
+            "firstNotNull",
+            "count"
           ],
           "displayMode": "table",
           "placement": "bottom",
@@ -303,7 +304,9 @@
           ],
           "displayMode": "table",
           "placement": "bottom",
-          "showLegend": true
+          "showLegend": true,
+          "sortBy": "Max",
+          "sortDesc": true
         },
         "tooltip": {
           "mode": "multi",
@@ -317,7 +320,7 @@
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.90, sum by (le, service) (rate(traces_spanmetrics_latency_bucket[1m])))",
-          "legendFormat": "p90 {{service}}",
+          "legendFormat": "{{service}}",
           "range": true,
           "refId": "A"
         }
@@ -492,7 +495,32 @@
           },
           "unit": "s"
         },
-        "overrides": []
+        "overrides": [
+          {
+            "__systemRef": "hideSeriesFrom",
+            "matcher": {
+              "id": "byNames",
+              "options": {
+                "mode": "exclude",
+                "names": [
+                  "p99 currencyservice"
+                ],
+                "prefix": "All except:",
+                "readOnly": true
+              }
+            },
+            "properties": [
+              {
+                "id": "custom.hideFrom",
+                "value": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": true
+                }
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
         "h": 9,
@@ -505,11 +533,14 @@
         "legend": {
           "calcs": [
             "lastNotNull",
-            "max"
+            "max",
+            "count"
           ],
           "displayMode": "table",
           "placement": "bottom",
-          "showLegend": true
+          "showLegend": true,
+          "sortBy": "Last *",
+          "sortDesc": true
         },
         "tooltip": {
           "mode": "multi",
@@ -985,6 +1016,6 @@
   "timezone": "",
   "title": "Golden Signals \u2014 Deep Dive",
   "uid": "golden-signals",
-  "version": 26,
+  "version": 30,
   "weekStart": ""
 }
