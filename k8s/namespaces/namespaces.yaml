@@ -1,32 +1,40 @@
 # namespaces/namespaces.yaml
 # =============================================================================
-# Namespace definitions + ResourceQuotas for the SRE Demo Platform
+# SINGLE SOURCE OF TRUTH for namespaces and ResourceQuotas.
+# boutique.yaml does NOT define quotas — they live here exclusively.
 # =============================================================================
 #
-# ResourceQuota rationale for M5 Pro 64GB / 8 vCPU:
+# ResourceQuota rationale — M5 Pro 14" 64GB / 8 vCPU node:
 #
-# Total node capacity: 8 CPU, ~60GB usable RAM (Docker Desktop reserves ~4GB)
+# Total node capacity: 8 CPU (8000m), ~60GB usable RAM
 #
-# Budget allocation:
-#   boutique namespace:      16 CPU requests / 32 CPU limits
-#   observability namespace:  3 CPU requests / 12 CPU limits
-#   kube-system:             ~0.5 CPU reserved (metrics-server, coredns, etc.)
+# BOUTIQUE namespace — v6 node budget at MAX HPA replicas:
+#   frontend:      10 × 50m  =  500m  requests
+#   productcat:     6 × 30m  =  180m
+#   cart:           5 × 50m  =  250m
+#   checkout:       6 × 25m  =  150m
+#   currency:      10 × 15m  =  150m
+#   recommend:      5 × 25m  =  125m
+#   adservice:      1 × 30m  =   30m
+#   fixed svcs:               ~155m  (redis/email/payment/shipping)
+#   ─────────────────────────────────
+#   Total boutique:          ~1540m  requests at full HPA expansion
 #
-# WHY requests.cpu="16" NOT "6":
-#   The original "6" quota was the root cause of repeated load test failures.
-#   At ~8 minutes into a 100 VU test, HPA tries to scale cartservice/frontend.
-#   Each new pod needs 500m CPU request. With "6" as the hard ceiling and
-#   ~4050m already used at idle, only 1950m remained — blocking HPA from
-#   scheduling more than 3-4 additional pods. The pods stayed overloaded,
-#   cartservice hit its CPU *limit* (1000m or 1500m), got throttled to 100%,
-#   and the cascade: throttled cart → frontend goroutines pile up → all
-#   requests timeout → app appears completely dead.
+# WHY requests.cpu="16" (not "4" or "1.54"):
+#   The quota is not a target — it is a ceiling.
+#   "4" was introduced in boutique.yaml v5 and caused a real incident:
+#   at 300 VU, HPA tried to schedule 8 new pods × 50m = 400m, pushing
+#   total requests over 4000m → quota admission rejection → pods Pending
+#   → HPA could not scale → services saturated → cascade failure.
 #
-#   requests.cpu="16" gives HPA full room to scale all services to max
-#   simultaneously without hitting the scheduler wall.
-#   limits.cpu="32" is the safety net preventing true node saturation.
+#   "16" gives HPA full room to double all services simultaneously
+#   without hitting the scheduler wall. We have 8 CPU on the node —
+#   16 CPU requests is fine because limits (32) are the actual safety net.
+#   The scheduler uses requests for bin-packing, not limits.
 #
-# Memory: generous, M5 Pro has 64GB — memory is not the constraint here.
+# OBSERVABILITY namespace:
+#   Prometheus + Loki + Tempo + Grafana + Alloy + kube-state-metrics
+#   Kept conservative — observability must not starve boutique.
 # =============================================================================
 
 apiVersion: v1
@@ -44,14 +52,11 @@ metadata:
   namespace: boutique
 spec:
   hard:
-    # requests.cpu=16: allows all HPAs to scale to max simultaneously
-    # limits.cpu=32:   safety net against true node saturation
-    requests.cpu: "16"
-    limits.cpu: "32"
-    requests.memory: "20Gi"
+    requests.cpu: "16"      # ceiling — HPA can scale all services to max simultaneously
+    limits.cpu: "32"        # hard safety net against node saturation
+    requests.memory: "20Gi" # generous — M5 Pro has 64GB, memory is not the constraint
     limits.memory: "40Gi"
-    # Pod count: prevents runaway HPA from infinite pod scheduling
-    pods: "60"
+    pods: "60"              # prevents runaway HPA from infinite pod scheduling
 ---
 apiVersion: v1
 kind: Namespace
@@ -69,7 +74,7 @@ metadata:
 spec:
   hard:
     requests.cpu: "3"
-    limits.cpu: "12"    # Prometheus + Alloy peak during compaction can hit 4-5 CPU
+    limits.cpu: "12"        # Prometheus + Alloy peak during compaction: 4-5 CPU
     requests.memory: "4Gi"
     limits.memory: "12Gi"
     pods: "20"

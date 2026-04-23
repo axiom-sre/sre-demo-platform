@@ -526,6 +526,20 @@ resume() {
     warn "Continuing resume — Grafana will re-seed from ConfigMap defaults."
   fi
 
+
+  # ── Cluster infra re-apply ────────────────────────────────────────────────
+  # metrics-server must match YAML spec. If selector label changed (immutable),
+  # delete+recreate the deployment only — RBAC and Service are idempotent.
+  info "Re-applying cluster infra..."
+  CLUSTER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/cluster"
+  if ! kubectl apply -f "$CLUSTER_DIR/metrics-server.yaml" 2>/dev/null; then
+    warn "  metrics-server apply failed (immutable selector) — forcing recreate..."
+    kubectl delete deployment metrics-server -n kube-system --ignore-not-found 2>/dev/null
+    kubectl apply -f "$CLUSTER_DIR/metrics-server.yaml"
+  fi
+  kubectl rollout status deployment/metrics-server -n kube-system --timeout=60s 2>/dev/null \
+    && info "  metrics-server ✓" || warn "  metrics-server slow — HPA targets may show <unknown> briefly"
+
   # Restore alloy DaemonSet (remove the suspend nodeSelector)
   kubectl patch daemonset alloy -n observability     --type=json     -p='[{"op":"remove","path":"/spec/template/spec/nodeSelector/suspend"}]'     2>/dev/null && info "  alloy DaemonSet → restored" || true
 

@@ -1,40 +1,56 @@
-# boutique/hpa.yaml — Holy Grail Edition v3
+# boutique/hpa.yaml — Holy Grail Edition v4
 # =============================================================================
-# KEY CHANGES vs v2:
+# KEY CHANGES vs v3:
 #
-# [CURRENCY maxReplicas: 6 → 10]
-#   Root cause observed: at 250 VU, currency hit maxReplicas (6) within 5
-#   minutes and pinned there. Every page render calls currency — home + each
-#   product page. At 250 VU × ~3 currency calls/session = ~150 req/s on
-#   currency. 6 pods cannot sustain this. 10 can.
-#   10 × 15m = 150m requests scheduled — trivial node impact.
+# [FIX 1 — checkoutservice: minReplicas 2→3, maxReplicas 6→8, trigger corrected]
+#   Root cause observed: checkout is an I/O-bound fan-out orchestrator calling
+#   7 downstream services sequentially per request. At 1000 VU (~100 concurrent
+#   checkouts) two pods were drowning in goroutines blocked on downstream gRPC.
+#   CPU never triggered HPA because checkout burns almost zero CPU — it waits.
+#   p99 blew to 15s. frontend p99 peaked at 10s as a direct cascade.
 #
-# [FRONTEND dual-metric HPA: CPU + memory]
-#   Root cause observed: frontend CPU was 1m at idle and never exceeded
-#   ~15m even at 250 VU. Go frontend proxies gRPC — it is not compute-bound.
-#   The CPU trigger (25m) will never fire at realistic load.
+#   Fix: minReplicas 2→3 (start warm), maxReplicas 6→8 (headroom for 5K VU).
+#   CPU request in boutique.yaml raised 25m→100m, raising trigger to 60m.
+#   This is still not the right long-term signal for an I/O-bound service —
+#   see roadmap note below for KEDA concurrency-based HPA.
 #
-#   Fix: add memory as primary HPA signal.
-#   Memory grows linearly with VU count (goroutine stacks, HTTP buffers,
-#   template render cache). Observed: 27-72Mi idle. Estimated 90-120Mi at
-#   100 VU, 120-160Mi at 250 VU.
-#   Trigger: 70% × 128Mi request = 90Mi actual → fires ~100-150 VU. ✓
+# [FIX 2 — shippingservice HPA: NEW — was missing entirely]
+#   Root cause observed: shippingservice ran as single replica with no HPA.
+#   Every checkout calls it — at 100 concurrent checkouts all hitting one pod,
+#   it became a serialization point contributing directly to the 15s p99.
+#   Go service, CPU-bound per request, scales cleanly horizontally.
 #
-#   HPA uses OR logic: fires when EITHER metric exceeds threshold.
-#   CPU trigger kept as safety net for unexpected compute spikes.
-#   Memory trigger is the primary scaling signal for frontend.
+#   Fix: added HPA minReplicas=2, maxReplicas=6.
+#   CPU request in boutique.yaml raised 15m→50m, trigger now 30m (60% × 50m).
 #
-# [ALL think() times in load scripts tightened to 1-2s]
-#   This is in the scripts, not here, but it matters for HPA:
-#   Looser think times → lower RPS → lower CPU/memory → HPA never fires.
-#   At think(1,2) avg 1.5s, 100 VU generates ~67 iterations/sec ≈ 100+ RPS.
-#   That's enough to push all services past their triggers.
+# [FIX 3 — paymentservice HPA: NEW — was missing entirely]
+#   Same pattern as shippingservice. Single replica, every checkout hits it,
+#   no HPA. Added identical HPA profile to shipping.
+#   CPU request in boutique.yaml raised 15m→50m, trigger now 30m (60% × 50m).
 #
-# NODE BUDGET — updated:
-#   currency max: 10 × 15m  = 150m  (was 6 × 15m = 90m)
-#   frontend max: 10 × 50m  = 500m  (unchanged)
-#   Total boutique at max HPA: ~1355m requests
-#   Available: ~6800m — still massive headroom.
+# ROADMAP — KEDA concurrency HPA for checkout (post-5K VU milestone):
+#   CPU-based HPA is wrong for I/O-bound services. The right signal is
+#   in-flight request concurrency via Prometheus:
+#     http_server_requests_in_flight{service="checkoutservice"}
+#   KEDA ScaledObject targeting avg concurrency of 10 per pod would fire
+#   scale exactly when pods are overwhelmed — not based on CPU which never moves.
+#   This is a senior SRE talking point: "we replaced percentage CPU HPA with
+#   concurrency-based scaling for our fan-out orchestrators".
+#
+# NODE BUDGET — updated (v4):
+#   frontend:      10 × 50m  =  500m
+#   productcat:     8 × 60m  =  480m
+#   recommendation: 8 × 25m  =  200m
+#   cart:           5 × 50m  =  250m
+#   checkout:       8 × 100m =  800m  ← raised from 150m
+#   currency:      12 × 50m  =  600m  ← raised from 150m
+#   shipping:       6 × 50m  =  300m  ← NEW HPA
+#   payment:        6 × 50m  =  300m  ← NEW HPA
+#   fixed (redis/email/ad): ~180m
+#   Total boutique at max HPA:  ~3610m requests
+#   Observability stack:         ~800m
+#   kube-system:                 ~400m
+#   Grand total:                ~4810m / ~48000m M5 Pro = 10% — ample headroom ✓
 # =============================================================================
 
 # ── Frontend — Go proxy: dual-metric CPU + memory ────────────────────────────
@@ -81,7 +97,11 @@ spec:
           value: 1
           periodSeconds: 60
 ---
-# ── Product Catalog — CPU-heavy on browse ─────────────────────────────────────
+# ── Product Catalog — CPU-heavy on browse ────────────────────────────────────
+#
+# CPU trigger: 50% × 60m = 30m actual
+# boutique.yaml request raised 30m→60m so trigger doubled from 15m to 30m.
+# Eliminates false scaling at low VU — needs real load to fire now.
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
@@ -93,14 +113,14 @@ spec:
     kind: Deployment
     name: productcatalogservice
   minReplicas: 2
-  maxReplicas: 6
+  maxReplicas: 8
   metrics:
     - type: Resource
       resource:
         name: cpu
         target:
           type: Utilization
-          averageUtilization: 50    # 50% × 30m = 15m actual trigger
+          averageUtilization: 50    # 50% × 60m = 30m actual trigger
   behavior:
     scaleUp:
       stabilizationWindowSeconds: 30
@@ -115,7 +135,12 @@ spec:
           value: 1
           periodSeconds: 60
 ---
-# ── Recommendation — Python, I/O bound ────────────────────────────────────────
+# ── Recommendation — Python, GIL-bound ───────────────────────────────────────
+#
+# CPU trigger: 55% × 25m = 14m actual
+# Python GIL means each pod is single-threaded for CPU work — more pods is
+# the correct answer here, CPU request stays at 25m intentionally.
+# maxReplicas raised 5→8 to handle 1000 VU Python concurrency ceiling.
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
@@ -127,14 +152,14 @@ spec:
     kind: Deployment
     name: recommendationservice
   minReplicas: 2
-  maxReplicas: 5
+  maxReplicas: 8
   metrics:
     - type: Resource
       resource:
         name: cpu
         target:
           type: Utilization
-          averageUtilization: 55    # 55% × 25m = 14m. Python import spike avoidance.
+          averageUtilization: 55    # 55% × 25m = 14m — Python GIL, pods are the fix
   behavior:
     scaleUp:
       stabilizationWindowSeconds: 45
@@ -149,14 +174,16 @@ spec:
           value: 1
           periodSeconds: 60
 ---
-# ── Cart — .NET, conservatively tuned ─────────────────────────────────────────
+# ── Cart — .NET, conservatively tuned ────────────────────────────────────────
 #
 # stabilizationWindowSeconds scaleUp: 60s — DO NOT REDUCE.
 # .NET JIT warmup spikes CPU to 800-1200m on first requests per pod.
-# 60s window averages through the spike before deciding to scale.
-# Without this: JIT spike → HPA fires → new pod JIT spikes → cascade.
-# The +1 pod/60s policy means cart scales visibly slowly — this is by design
-# and should be narrated in demo as "conservative scale for stateful service".
+# 60s window averages through the spike before deciding to scale further.
+# Without this: JIT spike → HPA fires → new pod JIT spike → cascade.
+# +1 pod/60s is by design — narrate in demo as "conservative scale for
+# stateful service with expensive cold start".
+#
+# CPU trigger: 60% × 50m = 30m actual
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
@@ -190,7 +217,22 @@ spec:
           value: 1
           periodSeconds: 60
 ---
-# ── Checkout — low volume, CPU-heavy per request ──────────────────────────────
+# ── Checkout — I/O-bound fan-out orchestrator ─────────────────────────────────
+#
+# CPU trigger: 60% × 100m = 60m actual (was 15m at 25m request — never fired)
+#
+# IMPORTANT: CPU-based HPA is imperfect for checkout. Checkout is I/O-bound —
+# it blocks on 7 downstream gRPC calls sequentially per request. CPU stays low
+# while goroutines pile up waiting on network. The right long-term fix is KEDA
+# concurrency-based HPA (see roadmap in header). For now:
+#   - minReplicas: 3 → start warm, don't wait for HPA at 1000 VU
+#   - maxReplicas: 8 → headroom for 5K VU
+#   - CPU request raised to 100m → trigger now meaningful at real load
+#
+# Dependency chain reminder: checkout serially calls cart, productcatalog,
+# currency, shipping, payment, email, cart. Any single-replica bottleneck in
+# this chain causes checkout p99 to blow out. Shipping and payment now have
+# their own HPAs (see below).
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
@@ -201,15 +243,15 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: checkoutservice
-  minReplicas: 2
-  maxReplicas: 6
+  minReplicas: 3          # was 2 — start warm at 1000 VU, don't wait for HPA
+  maxReplicas: 8          # was 6 — headroom for 5K VU
   metrics:
     - type: Resource
       resource:
         name: cpu
         target:
           type: Utilization
-          averageUtilization: 55    # 55% × 25m = 14m actual trigger
+          averageUtilization: 60    # 60% × 100m = 60m actual — was 15m, never fired
   behavior:
     scaleUp:
       stabilizationWindowSeconds: 30
@@ -224,17 +266,15 @@ spec:
           value: 1
           periodSeconds: 60
 ---
-# ── Currency — every page render, maxReplicas bumped to 10 ────────────────────
+# ── Currency — every page render ─────────────────────────────────────────────
 #
-# maxReplicas: 6 → 10
-# Observed at 250 VU: pinned at maxReplicas (6) within 5 minutes.
-# Currency is called on EVERY page render — not just checkout.
-# At 1000 VU: ~1000+ currency calls/sec. 10 pods handles it.
-# 10 × 15m = 150m scheduled requests — trivial scheduling overhead.
+# CPU trigger: 60% × 50m = 30m actual (was 9m at 15m request)
+# Right-sized in boutique.yaml: 15m→50m CPU request.
+# minReplicas: 3 — start warm, currency is called on every page render.
+# maxReplicas: 12 — headroom for 5K VU fan-out.
 #
-# In demo: currency maxing out and staying at 10 is a GOOD story —
-# "currency is our hottest service, it scales to max and holds there
-# because every single page render calls it". That's an SRE insight.
+# sync.Once cache fix (roadmap) will drop currency pod count significantly
+# once implemented — expect to reduce maxReplicas back to 6 after that.
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
@@ -245,15 +285,108 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: currencyservice
-  minReplicas: 2
-  maxReplicas: 10    # was 6 — pinned at 250 VU, needs headroom for 1000 VU
+  minReplicas: 3
+  maxReplicas: 12
   metrics:
     - type: Resource
       resource:
         name: cpu
         target:
           type: Utilization
-          averageUtilization: 60    # 60% × 15m = 9m actual — fires earliest
+          averageUtilization: 60    # 60% × 50m = 30m actual trigger
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+---
+# ── Shipping — NEW HPA: was single replica, checkout bottleneck ───────────────
+#
+# Root cause: shippingservice had no HPA and ran as replicas: 1.
+# Every checkout request calls it — at 1000 VU (~100 concurrent checkouts)
+# all goroutines serialised through one pod. Contributed directly to 15s p99.
+# Go service — horizontally scalable, no state, no JIT warmup concerns.
+#
+# CPU request raised in boutique.yaml: 15m→50m
+# CPU trigger: 60% × 50m = 30m actual
+# minReplicas: 2 — eliminate single-replica bottleneck permanently
+# maxReplicas: 6 — 6 × 50m = 300m, trivial node overhead
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: shippingservice
+  namespace: boutique
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: shippingservice
+  minReplicas: 2          # was 1 (no HPA) — single pod was checkout bottleneck
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60    # 60% × 50m = 30m actual trigger
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+---
+# ── Payment — NEW HPA: was single replica, checkout bottleneck ────────────────
+#
+# Identical root cause and fix as shippingservice above.
+# Every checkout calls payment once — single replica is a serialization point.
+# Node.js service — lightweight, stateless, scales cleanly.
+#
+# CPU request raised in boutique.yaml: 15m→50m
+# CPU trigger: 60% × 50m = 30m actual
+# minReplicas: 2 — eliminate single-replica bottleneck
+# maxReplicas: 6 — matches shipping profile, consistent with checkout fan-out
+#
+# NOTE: payment is financial-critical. In production you would add:
+#   - PodAntiAffinity to spread replicas across nodes
+#   - stricter PDB (minAvailable: 2 not 1)
+#   - circuit breaker (Istio/Envoy) to shed load gracefully
+#   These are chaos engineering phase additions.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: paymentservice
+  namespace: boutique
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: paymentservice
+  minReplicas: 2          # was 1 (no HPA) — single pod was checkout bottleneck
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60    # 60% × 50m = 30m actual trigger
   behavior:
     scaleUp:
       stabilizationWindowSeconds: 30

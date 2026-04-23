@@ -1,21 +1,29 @@
 #!/usr/bin/env bash
 # =============================================================================
-# bootstrap.sh — SRE Demo Platform: First-Time Setup
+# bootstrap.sh — SRE Demo Platform: First-Time Setup v2
 # =============================================================================
 # Run ONCE on a fresh machine before anything else.
 # After this, use: bash scripts/start.sh  (from k8s/) after every reboot.
 #
-# Prerequisites before running:
-#   1. Install Docker Desktop: https://www.docker.com/products/docker-desktop/
-#   2. Docker Desktop → Settings → Resources → 24GB RAM, 8 CPU → Apply & Restart
-#   3. Docker Desktop → Settings → Kubernetes → Enable Kubernetes → Apply & Restart
-#   4. brew install kubectl k6
+# Prerequisites:
+#   1. Docker Desktop: https://www.docker.com/products/docker-desktop/
+#      Settings → Resources → 24GB RAM, 8 CPU → Apply & Restart
+#      Settings → Kubernetes → Enable Kubernetes → Apply & Restart
+#   2. brew install kubectl k6
 #
 # Usage (from k8s/ directory):
 #   bash scripts/bootstrap.sh
 #
-# Pass 1 change: Alloy is now a DaemonSet (for log collection via hostPath).
-# All references to `deployment/alloy` replaced with `daemonset/alloy`.
+# KEY CHANGES vs v1:
+#   [v2] metrics-server source changed to cluster/metrics-server.yaml.
+#        Previously applied via infrastructure.yaml (dual source of truth).
+#        infrastructure.yaml now only deploys kube-state-metrics + node-exporter.
+#        This matches start.sh v5 and resume() in manage.sh — all three scripts
+#        now use the same single canonical source for metrics-server.
+#   [v2] Local registry setup added.
+#        bootstrap.sh previously assumed the patched frontend image was already
+#        in the registry. Now it starts the registry and prints rebuild instructions
+#        so first-time setup is self-contained.
 # =============================================================================
 set -euo pipefail
 
@@ -46,7 +54,7 @@ echo ""
 # ── Phase 0: Preflight ───────────────────────────────────────────────────────
 log "Phase 0: Preflight checks..."
 
-for cmd in kubectl k6 curl python3; do
+for cmd in kubectl k6 curl python3 docker; do
   command -v "$cmd" &>/dev/null || die "$cmd not found. Install: brew install $cmd"
   ok "$cmd: $(command -v $cmd)"
 done
@@ -88,14 +96,32 @@ kubectl patch storageclass local-path \
   2>/dev/null || true
 ok "local-path set as default StorageClass"
 
-# ── Phase 2: Namespaces ───────────────────────────────────────────────────────
-log "Phase 2: Creating namespaces..."
+# ── Phase 2: Namespaces + PriorityClasses ─────────────────────────────────────
+log "Phase 2: Creating namespaces and PriorityClasses..."
+kubectl apply -f "$ROOT/namespaces/priority-classes.yaml"
 kubectl apply -f "$ROOT/namespaces/namespaces.yaml"
-ok "Namespaces: observability, boutique"
+ok "PriorityClasses + namespaces ready"
 
-# ── Phase 3: Observability stack ──────────────────────────────────────────────
-log "Phase 3: Deploying observability stack (Prometheus, Loki, Tempo)..."
+# ── Phase 3: metrics-server ───────────────────────────────────────────────────
+log "Phase 3: Deploying metrics-server..."
+# Single source of truth: cluster/metrics-server.yaml
+# infrastructure.yaml does NOT contain metrics-server.
+if ! kubectl apply -f "$ROOT/cluster/metrics-server.yaml" 2>/dev/null; then
+  warn "metrics-server apply failed (immutable selector) — forcing recreate..."
+  kubectl delete deployment metrics-server -n kube-system --ignore-not-found 2>/dev/null
+  kubectl apply -f "$ROOT/cluster/metrics-server.yaml"
+fi
+kubectl rollout status deployment/metrics-server -n kube-system --timeout=120s
+ok "metrics-server ready (v0.7.2, --kubelet-insecure-tls)"
+
+# ── Phase 4: Observability stack ──────────────────────────────────────────────
+log "Phase 4: Deploying observability stack..."
 log "This pulls ~2GB of images on first run — patience..."
+
+# kube-state-metrics + node-exporter only (metrics-server is handled above)
+kubectl apply -f "$ROOT/observability/infrastructure/infrastructure.yaml"
+kubectl rollout status deployment/kube-state-metrics -n observability --timeout=120s
+ok "kube-state-metrics + node-exporter ready"
 
 kubectl apply -f "$ROOT/observability/prometheus/prometheus.yaml"
 kubectl apply -f "$ROOT/observability/loki/loki.yaml"
@@ -107,21 +133,51 @@ kubectl rollout status deployment/loki       -n observability --timeout=180s
 kubectl rollout status deployment/tempo      -n observability --timeout=180s
 ok "Prometheus, Loki, Tempo ready"
 
-kubectl apply -f "$ROOT/observability/infrastructure/infrastructure.yaml"
-kubectl rollout status deployment/kube-state-metrics -n observability --timeout=120s
-ok "Infrastructure exporters ready (node-exporter, kube-state-metrics, metrics-server)"
-
 kubectl apply -f "$ROOT/observability/alloy/alloy.yaml"
-# PASS 1 CHANGE: Alloy is now a DaemonSet for log collection via hostPath
 kubectl rollout status daemonset/alloy -n observability --timeout=120s
 ok "Alloy ready (OTLP collector + log shipper — DaemonSet)"
 
 kubectl apply -f "$ROOT/observability/grafana/grafana.yaml"
 kubectl rollout status deployment/grafana -n observability --timeout=120s
-ok "Grafana ready (3 dashboards pre-loaded, PVC-backed)"
+ok "Grafana ready (dashboards pre-loaded, PVC-backed)"
 
-# ── Phase 4: Boutique application ─────────────────────────────────────────────
-log "Phase 4: Deploying Online Boutique..."
+# ── Phase 5: Local registry + patched frontend ────────────────────────────────
+log "Phase 5: Local Docker registry for patched frontend image..."
+if docker ps --format '{{.Names}}' | grep -q "^local-registry$"; then
+  ok "Local registry already running"
+else
+  docker run -d -p 5001:5000 --name local-registry registry:2 2>/dev/null || \
+    docker start local-registry 2>/dev/null || true
+  sleep 2
+  ok "Local registry started on :5001"
+fi
+
+if docker manifest inspect localhost:5001/boutique-frontend:arm64-v1 &>/dev/null 2>&1; then
+  ok "Patched frontend image present in registry ✓"
+else
+  warn "Patched frontend image NOT found — frontend will ImagePullBackOff."
+  warn ""
+  warn "Build and push the image:"
+  warn "  1. Clone sparse frontend source:"
+  warn "     mkdir -p /tmp/boutique-patch && cd /tmp/boutique-patch"
+  warn "     git init && git remote add origin https://github.com/GoogleCloudPlatform/microservices-demo"
+  warn "     git sparse-checkout set src/frontend && git pull origin main"
+  warn ""
+  warn "  2. Apply the one-line patch to src/frontend/rpc.go:"
+  warn "     avoidNoopCurrencyConversionRPC = true"
+  warn ""
+  warn "  3. Build and push:"
+  warn "     docker buildx build --platform linux/arm64 \\"
+  warn "       --build-arg TARGETARCH=arm64 --build-arg TARGETOS=linux \\"
+  warn "       --load -t boutique-frontend:arm64-v1 src/frontend/"
+  warn "     docker tag boutique-frontend:arm64-v1 localhost:5001/boutique-frontend:arm64-v1"
+  warn "     docker push localhost:5001/boutique-frontend:arm64-v1"
+  warn ""
+  warn "Continuing bootstrap — all other services will deploy normally."
+fi
+
+# ── Phase 6: Boutique application ─────────────────────────────────────────────
+log "Phase 6: Deploying Online Boutique..."
 log "adservice (Java JVM) and cartservice (C# .NET) are slow on first pull — normal."
 
 kubectl apply -f "$ROOT/boutique/boutique.yaml"
@@ -136,8 +192,8 @@ sleep 45
 kubectl apply -f "$ROOT/boutique/hpa.yaml"
 ok "HPA policies applied"
 
-# ── Phase 5: Port-forwards ────────────────────────────────────────────────────
-log "Phase 5: Starting port-forwards..."
+# ── Phase 7: Port-forwards ────────────────────────────────────────────────────
+log "Phase 7: Starting port-forwards..."
 pkill -f "kubectl port-forward" 2>/dev/null || true
 sleep 2
 
@@ -150,8 +206,8 @@ _pf observability tempo      3200  3200
 _pf observability loki       3100  3100
 sleep 8
 
-# ── Phase 6: Smoke tests ──────────────────────────────────────────────────────
-log "Phase 6: Smoke tests..."
+# ── Phase 8: Smoke tests ──────────────────────────────────────────────────────
+log "Phase 8: Smoke tests..."
 
 chk() {
   local name=$1 url=$2
@@ -175,24 +231,28 @@ echo -e "${BOLD}${GREEN}══════════════════�
 echo -e "${BOLD}${GREEN}  Bootstrap COMPLETE — Stack is READY${NC}"
 echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════${NC}"
 echo ""
-echo -e "  Boutique     http://localhost:8080   (NodePort: :30080)"
+echo -e "  Boutique     http://localhost:8080"
 echo -e "  Grafana      http://localhost:3000   admin / admin"
 echo -e "  Prometheus   http://localhost:9090"
 echo -e "  Alloy UI     http://localhost:12345"
 echo ""
 echo -e "  Grafana dashboards (pre-loaded, survive pod restarts):"
-echo -e "    - Boutique — Golden Signals"
-echo -e "    - Boutique — Pod & Platform Stats"
-echo -e "    - Boutique — SLI / SLO / Error Budget"
+echo -e "    - SRE Command Center"
+echo -e "    - Golden Signals — Deep Dive"
+echo -e "    - Infrastructure & Node"
+echo -e "    - Platform & HPA"
+echo -e "    - SLO & Error Budget"
 echo ""
 echo -e "  Next steps:"
-echo -e "    Verify pipelines:  bash scripts/manage.sh verify"
-echo -e "    Send traffic:      k6 run scripts/load-test_10vusers.js"
-echo -e "    Full load test:    k6 run scripts/load-test_1000vusers.js"
-echo -e "    Stability harness: bash scripts/verify-stability.sh"
-echo -e "    HPA watch:         kubectl get hpa -n boutique -w"
+echo -e "    Smoke test:        k6 run scripts/load-test_10vusers.js"
+echo -e "    100 VU:            k6 run scripts/load-test_100vusers.js"
+echo -e "    1000 VU:           k6 run scripts/load-test_1000vusers.js"
+echo -e "    Stability harness: bash scripts/verify-stability.sh --short"
+echo -e "    HPA watch:         bash scripts/manage.sh hpa-watch"
+echo -e "    Full debug:        bash scripts/manage.sh debug"
 echo ""
 echo -e "  After every reboot:  bash scripts/start.sh"
-echo -e "  Stop everything:     bash scripts/manage.sh stop"
+echo -e "  Suspend (free RAM):  bash scripts/manage.sh suspend"
+echo -e "  Resume:              bash scripts/manage.sh resume"
 echo -e "  Full reset:          bash scripts/manage.sh nuke"
 echo ""

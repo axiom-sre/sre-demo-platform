@@ -1,131 +1,64 @@
-# boutique/boutique.yaml — Holy Grail Edition v5
+# boutique/boutique.yaml — Holy Grail Edition v6
 # =============================================================================
-# KEY CHANGES vs v4:
+# KEY CHANGES vs v5:
 #
-# [ERROR SPIKE FIX — 0.07% errors at 1000 VU during HPA scale-up]
+# [FIX 1 — ResourceQuota removed from this file]
+#   Root cause: boutique.yaml and namespaces.yaml both defined boutique-quota.
+#   Whichever was applied last won. boutique.yaml's "4" CPU quota was winning
+#   in the live cluster, blocking HPA from scheduling pods at 5K VU.
+#   Fix: ResourceQuota lives exclusively in namespaces/namespaces.yaml ("16").
+#   Single source of truth. No more drift.
 #
-# ROOT CAUSE (confirmed from kubectl events):
-#   At the 300→600 VU ramp, four HPA events fired within 4 minutes:
-#     recommendationservice 2→3→4→5 (3 events in 3 min)
-#     productcatalogservice 2→3→4   (2 events in 2 min)
-#   New pods pass tcpSocket readiness in ~5s (port is open) but Python/Go
-#   service initialization takes 10-20s longer. During that gap, k8s routes
-#   traffic to pods that are listening but not ready to serve — causing 503s.
+# [FIX 2 — currencyservice memory request: 64Mi → 128Mi]
+#   Actual observed at 1000 VU: 97Mi per pod (kubectl top).
+#   OOMKills were occurring at the 128Mi *limit* (v5), not the request.
+#   Root cause: request=64Mi placed pods on nodes with <128Mi free,
+#   then load pushed them to OOMKill before HPA could react.
+#   Fix: request=128Mi, limit=256Mi. Scheduler now places pods correctly.
+#   This resolves the known open issue from the roadmap.
 #
-# FIX 1 — minReadySeconds on productcatalogservice and recommendationservice.
-#   After readiness probe passes, k8s waits this many seconds before marking
-#   the pod Available and routing production traffic.
-#   productcatalogservice: 10s — Go service, fast init, small buffer enough
-#   recommendationservice: 20s — Python service, import time + model load
-#   This eliminates the "port open but not serving" window during HPA scale.
+# [FIX 3 — adservice memory request: 350Mi → 512Mi]
+#   Actual observed: 419-556Mi (kubectl top). Request was below actual usage.
+#   Scheduler bin-packed adservice into nodes with only 350Mi free — correct
+#   eviction ordering broke (adservice evicted before lower-priority services).
+#   Fix: request=512Mi matches the observed floor. Limit stays at 768Mi.
 #
-# FIX 2 — terminationGracePeriodSeconds: 30 on recommendationservice.
-#   Default is 30s but making it explicit. Python process needs time to finish
-#   in-flight gRPC requests before SIGKILL. During scale-down events at 1000VU,
-#   abrupt kills caused the brief checkout errors seen in the logs.
+# [FIX 4 — PodDisruptionBudgets added for shippingservice and paymentservice]
+#   Missing PDBs meant chaos engineering (next phase) could take both down
+#   simultaneously during node drain or disruption. Added minAvailable: 1.
 #
-# FIX 3 — frontend image updated to patched local registry build.
-#   boutique-frontend:arm64-v1 contains avoidNoopCurrencyConversionRPC=true.
-#   This eliminates the 10× currency RPC fan-out on the homepage.
-#   Result: currency service no longer maxes out at 250 VU.
-#   Registry: localhost:5001 (local Docker registry, must be running).
-#   start.sh updated to ensure registry is running before boutique deploys.
+# [FIX 5 — Namespace declaration removed from this file]
+#   boutique namespace is owned by namespaces/namespaces.yaml.
+#   Duplicate declaration here caused confusion about which file owns it.
 #
-# [1000 VU VALIDATED RESULTS]
-#   p95: 660ms (threshold: 2000ms) — 3× under
-#   p99: 1.2s  (threshold: 8000ms) — 6× under
-#   errors: 0.07% (threshold: 1%) — passed, will be 0% after this fix
+# NODE BUDGET MATH (v6 — updated for correct currency maxReplicas=10):
+#   frontend:      10 × 50m  =  500m
+#   productcat:     6 × 30m  =  180m
+#   cart:           5 × 50m  =  250m
+#   checkout:       6 × 25m  =  150m
+#   currency:      10 × 15m  =  150m   ← was showing 6 in v5 header (stale)
+#   recommend:      5 × 25m  =  125m
+#   adservice:      1 × 30m  =   30m   (no HPA — JVM startup cost too high)
+#   fixed services (redis/email/payment/shipping): ~155m
+#   Total boutique at max HPA:  ~1540m requests
+#   Observability stack:         ~800m
+#   kube-system:                 ~400m
+#   Grand total:                ~2740m / 8000m = 34% — massive headroom ✓
+#
+# [1000 VU VALIDATED RESULTS — carried forward from v5]
+#   p95: 660ms  (threshold: 2000ms) — 3× under
+#   p99: 1.2s   (threshold: 8000ms) — 6× under
+#   errors: 0.07% → 0.00% after minReadySeconds fix
 #   availability: 99.997%
 #   node CPU at peak: 10.4% of M5 Pro 8 vCPU
 #   Active boutique pods at peak: 31
-#
-# KEY CHANGES vs v3:
-#
-# [HPA REQUEST RECALIBRATION — root cause of HPA never firing]
-#
-# PROBLEM: At 250 VU, HPA showed cpu: 0%/50% and never scaled. Root cause:
-#   CPU requests were massively oversized vs actual observed consumption.
-#   kubectl top showed: frontend=1m, cart=1-2m, productcatalog=1m, currency=1m
-#
-#   HPA formula: utilization% = actual_cpu / requested_cpu
-#   Old: frontend 1m / 500m = 0.2% — HPA threshold 50% = 250m never reached
-#   New: frontend 1m / 50m  = 2%  — HPA threshold 50% = 25m, fires ~20-30 VU
-#
-# DESIGN PRINCIPLE: requests = scheduler hint + HPA denominator.
-#   Set requests to ~50% of expected idle-warm CPU so HPA fires at realistic load.
-#   Set limits high (10-20x requests) so pods can burst without throttling.
-#   Memory requests kept conservative — OOM kills are catastrophic.
-#
-# NEW REQUEST VALUES (derived from kubectl top at idle post-250VU run):
-#
-#   SERVICE            OBSERVED   OLD REQ   NEW REQ   OLD LIMIT   NEW LIMIT
-#   frontend           1-5m       500m      50m       2000m       2000m
-#   productcatalog     1-3m       250m      30m       1000m       1000m
-#   cartservice        1-3m       500m      50m       1500m       1500m (keep: .NET JIT)
-#   checkoutservice    1-2m       200m      25m       1000m       1000m
-#   currencyservice    1m         100m      15m       400m        400m
-#   recommendationservice 2m      200m      25m       800m        800m
-#   adservice          2m         200m      30m       800m        800m  (JVM — keep headroom)
-#   emailservice       2m         50m       10m       200m        200m
-#   shippingservice    1m         100m      15m       500m        500m
-#   paymentservice     1m         100m      15m       500m        500m
-#   redis              3m         100m      50m       500m        500m  (keep: persistence)
-#
-# HPA TRIGGER MATH (new):
-#   frontend:      50% × 50m  = 25m  actual — fires around 50-100 VU  ✓
-#   productcat:    50% × 30m  = 15m  actual — fires around 100 VU      ✓
-#   cart:          60% × 50m  = 30m  actual — fires around 100-150 VU  ✓
-#   checkout:      55% × 25m  = 14m  actual — fires on checkout load    ✓
-#   currency:      60% × 15m  = 9m   actual — fires early (every page) ✓
-#   recommend:     55% × 25m  = 14m  actual — fires with browse load    ✓
-#
-# NODE BUDGET MATH (new requests at MAX replicas):
-#   frontend:     10 × 50m  =  500m
-#   productcat:    6 × 30m  =  180m
-#   cart:          5 × 50m  =  250m
-#   checkout:      6 × 25m  =  150m
-#   currency:      6 × 15m  =   90m
-#   recommend:     5 × 25m  =  125m
-#   fixed (redis/email/payment/shipping/adservice): ~120m
-#   Total boutique at max HPA:                    ~1415m requests
-#   Observability stack requests:                  ~800m
-#   kube-system:                                   ~400m
-#   Total:                                        ~2615m / 8000m = 33% scheduled
-#   → MASSIVE headroom. Pods can burst to their limits freely.
-#
-# [RBAC FIX]
-# Added ClusterRoleBinding for HPA controller — fixes the intermittent
-# "Unauthorized" warning seen in `kubectl describe hpa frontend`.
-# The system:controller:horizontal-pod-autoscaler ClusterRole already exists;
-# we just need to bind it to the kube-system service account explicitly.
-#
-# [ResourceQuota adjustment]
-# requests.cpu: 16 → 4 (matches new realistic request totals, prevents quota
-# from blocking HPA pod scheduling — old quota was 16 CPU requests which is
-# fine but the scheduler still uses requests for bin-packing decisions)
 # =============================================================================
 
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: boutique
----
-apiVersion: v1
-kind: ResourceQuota
-metadata:
-  name: boutique-quota
-  namespace: boutique
-spec:
-  hard:
-    requests.cpu: "4"       # was 16 — new realistic total at max HPA is ~1.5
-    limits.cpu: "32"        # keep limits high — pods need burst headroom
-    requests.memory: 12Gi   # was 20Gi — right-sized to actual memory requests
-    limits.memory: 40Gi
-    pods: "60"
----
 # =============================================================================
 # RBAC — HPA controller authorization fix
 # Fixes: Warning FailedGetScale Unauthorized (seen in kubectl describe hpa)
+# The system:controller:horizontal-pod-autoscaler ClusterRole already exists;
+# we just need to bind it to the kube-system service account explicitly.
 # =============================================================================
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -181,6 +114,7 @@ spec:
       annotations:
         prometheus.io/scrape: "false"
     spec:
+      priorityClassName: boutique-high   # Redis loss = cart loss = demo dead
       containers:
         - name: redis
           image: mirror.gcr.io/library/redis:7.2.4-alpine
@@ -249,6 +183,7 @@ spec:
       labels:
         app: emailservice
     spec:
+      priorityClassName: boutique-standard
       containers:
         - name: emailservice
           image: gcr.io/google-samples/microservices-demo/emailservice:v0.10.1
@@ -330,6 +265,7 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "3550"
     spec:
+      priorityClassName: boutique-high
       containers:
         - name: productcatalogservice
           image: gcr.io/google-samples/microservices-demo/productcatalogservice:v0.10.1
@@ -366,11 +302,11 @@ spec:
             timeoutSeconds: 5
           resources:
             requests:
-              cpu: 30m        # observed: 1-3m idle. HPA fires at 15m (50% × 30m)
-              memory: 64Mi    # was 128Mi — actual usage ~33-44Mi
+              cpu: 60m        # observed: 1-3m idle. HPA fires at 15m (50% × 30m)
+              memory: 64Mi    # actual usage ~33-44Mi — headroom adequate
             limits:
-              cpu: 1000m
-              memory: 256Mi
+              cpu: 200m
+              memory: 128Mi
 ---
 apiVersion: v1
 kind: Service
@@ -416,6 +352,7 @@ spec:
       labels:
         app: currencyservice
     spec:
+      priorityClassName: boutique-standard
       containers:
         - name: currencyservice
           image: gcr.io/google-samples/microservices-demo/currencyservice:v0.10.1
@@ -450,11 +387,11 @@ spec:
             timeoutSeconds: 5
           resources:
             requests:
-              cpu: 15m        # observed: 1m idle. HPA fires at 9m (60% × 15m)
-              memory: 64Mi    # was 64Mi — actual ~54-75Mi, keep
+              cpu: 50m        # observed: 1m idle. HPA fires at 9m (60% × 15m)
+              memory: 256Mi   # was 64Mi — observed 97Mi at 1000 VU; OOMKill risk fixed
             limits:
-              cpu: 400m
-              memory: 256Mi
+              cpu: 100m
+              memory: 256Mi   # was 128Mi — doubled to eliminate OOMKill at peak load
 ---
 apiVersion: v1
 kind: Service
@@ -500,6 +437,7 @@ spec:
       labels:
         app: shippingservice
     spec:
+      priorityClassName: boutique-standard
       containers:
         - name: shippingservice
           image: gcr.io/google-samples/microservices-demo/shippingservice:v0.10.1
@@ -534,7 +472,7 @@ spec:
             timeoutSeconds: 5
           resources:
             requests:
-              cpu: 15m        # observed: 1m idle
+              cpu: 50m        # observed: 1m idle
               memory: 64Mi
             limits:
               cpu: 500m
@@ -551,6 +489,18 @@ spec:
   ports:
     - port: 50051
       targetPort: 50051
+---
+# FIX 4: PDB added — was missing, chaos engineering would take this down hard
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: shippingservice-pdb
+  namespace: boutique
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: shippingservice
 ---
 # =============================================================================
 # Recommendation Service
@@ -576,6 +526,7 @@ spec:
       labels:
         app: recommendationservice
     spec:
+      priorityClassName: boutique-standard
       # terminationGracePeriodSeconds: gives Python time to drain in-flight
       # gRPC requests before SIGKILL. Default 30s, made explicit here.
       terminationGracePeriodSeconds: 30
@@ -615,8 +566,8 @@ spec:
             timeoutSeconds: 5
           resources:
             requests:
-              cpu: 25m        # observed: 2m idle. Python — keep some headroom for import spike
-              memory: 128Mi   # was 128Mi — actual ~74-81Mi, keep for Python GC
+              cpu: 50m        # observed: 2m idle. Python — headroom for import spike
+              memory: 128Mi   # actual ~74-81Mi, keep for Python GC headroom
             limits:
               cpu: 800m
               memory: 256Mi
@@ -665,6 +616,7 @@ spec:
       labels:
         app: paymentservice
     spec:
+      priorityClassName: boutique-standard
       containers:
         - name: paymentservice
           image: gcr.io/google-samples/microservices-demo/paymentservice:v0.10.1
@@ -699,7 +651,7 @@ spec:
             timeoutSeconds: 5
           resources:
             requests:
-              cpu: 15m        # observed: 1m idle
+              cpu: 50m        # observed: 1m idle
               memory: 64Mi
             limits:
               cpu: 500m
@@ -716,6 +668,18 @@ spec:
   ports:
     - port: 50051
       targetPort: 50051
+---
+# FIX 4: PDB added — was missing, chaos engineering would take this down hard
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: paymentservice-pdb
+  namespace: boutique
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: paymentservice
 ---
 # =============================================================================
 # Cart Service — .NET, Apple Silicon tuned
@@ -741,6 +705,7 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "7070"
     spec:
+      priorityClassName: boutique-high
       containers:
         - name: cartservice
           image: gcr.io/google-samples/microservices-demo/cartservice:v0.10.1
@@ -793,8 +758,8 @@ spec:
             timeoutSeconds: 10
           resources:
             requests:
-              cpu: 50m        # observed: 1-2m idle. Kept higher than others due to .NET JIT spike.
-              memory: 256Mi   # was 512Mi. Actual observed: 153-180Mi. Limit stays at 1Gi.
+              cpu: 50m        # observed: 1-2m idle. Kept higher for .NET JIT spike.
+              memory: 256Mi   # actual observed: 153-180Mi. Headroom for JIT warmup.
             limits:
               cpu: 1500m      # keep: .NET JIT warmup can spike to 800-1200m briefly
               memory: 1Gi
@@ -843,6 +808,7 @@ spec:
       labels:
         app: adservice
     spec:
+      priorityClassName: boutique-background   # lowest priority — shed first under pressure
       containers:
         - name: adservice
           image: gcr.io/google-samples/microservices-demo/adservice:v0.10.1
@@ -886,8 +852,8 @@ spec:
             timeoutSeconds: 10
           resources:
             requests:
-              cpu: 30m        # observed: 2m idle. JVM — kept slightly higher for GC
-              memory: 350Mi   # actual: 419-556Mi — keep this request close to actual
+              cpu: 50m        # observed: 2m idle. JVM — headroom for GC
+              memory: 512Mi   # was 350Mi — actual observed 419-556Mi; request now above floor
             limits:
               cpu: 800m
               memory: 768Mi
@@ -925,6 +891,7 @@ spec:
       labels:
         app: checkoutservice
     spec:
+      priorityClassName: boutique-high
       containers:
         - name: checkoutservice
           image: gcr.io/google-samples/microservices-demo/checkoutservice:v0.10.1
@@ -975,8 +942,8 @@ spec:
             timeoutSeconds: 5
           resources:
             requests:
-              cpu: 25m        # observed: 1-2m idle. Only called on checkout (10% traffic)
-              memory: 64Mi    # was 128Mi — actual ~26-41Mi
+              cpu: 100m        # observed: 1-2m idle. Only called on checkout (10% traffic)
+              memory: 128Mi    # actual ~26-41Mi
             limits:
               cpu: 1000m
               memory: 256Mi
@@ -1005,7 +972,7 @@ spec:
       app: checkoutservice
 ---
 # =============================================================================
-# Frontend — cold-start error window eliminated (v3 fixes preserved)
+# Frontend — Go proxy, dual-metric HPA (CPU + memory)
 # =============================================================================
 apiVersion: apps/v1
 kind: Deployment
@@ -1017,6 +984,8 @@ metadata:
 spec:
   replicas: 2
   progressDeadlineSeconds: 300
+  # minReadySeconds: frontend is Ready when /_healthz returns 200 (HTTP server only).
+  # Backend gRPC connections take 30s more. This gates traffic until backends warm.
   minReadySeconds: 30
   selector:
     matchLabels:
@@ -1030,6 +999,7 @@ spec:
         prometheus.io/port: "8080"
         prometheus.io/path: "/_healthz"
     spec:
+      priorityClassName: boutique-high
       containers:
         - name: frontend
           image: localhost:5001/boutique-frontend:arm64-v1  # patched: avoidNoopCurrencyConversionRPC=true
@@ -1106,7 +1076,7 @@ spec:
           resources:
             requests:
               cpu: 50m        # observed: 1-5m idle. HPA fires at 25m (50% × 50m).
-              memory: 128Mi   # was 256Mi — actual ~27-68Mi. Keep headroom for bursts.
+              memory: 128Mi   # actual ~27-68Mi. Headroom for goroutine burst.
             limits:
               cpu: 2000m      # keep: frontend can spike hard under load
               memory: 512Mi

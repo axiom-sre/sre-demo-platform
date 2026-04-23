@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# start.sh — SRE Demo Platform: Full Startup v4
+# start.sh — SRE Demo Platform: Full Startup v5
 # =============================================================================
 #
 # Usage:
@@ -9,60 +9,42 @@
 #   bash scripts/start.sh --verify    # re-run pipeline verification only
 #
 # STARTUP ORDER (do not change — dependencies are load-bearing):
-#   0. PriorityClasses  — must exist before any pod is scheduled
-#   1. Namespaces + ResourceQuotas
-#   2. Observability infrastructure (infra + metrics-server)
-#   3. Core observability stack (Prometheus, Loki, Tempo, Alloy)
-#   4. Grafana
-#   5. Boutique application services
-#   6. HPA (must come AFTER metrics-server is ready)
-#   7. Port-forwards + pipeline verification
+#   0. Preflight
+#   1. PriorityClasses + Namespaces
+#   2. metrics-server          ← cluster/metrics-server.yaml (single source)
+#   3. Observability infra     ← kube-state-metrics, node-exporter only
+#   4. Core observability      ← Prometheus, Loki, Tempo
+#   5. Alloy
+#   6. Grafana
+#   7. Local registry check    ← patched frontend image must be present
+#   8. Boutique application
+#   9. HPA
+#  10. Port-forwards
+#  11. Warm gate + final status
 #
-# KEY CHANGES vs v2:
+# KEY CHANGES vs v4:
 #
-# 1. Frontend readiness wait now accounts for minReadySeconds=30.
-#    boutique.yaml v3 adds minReadySeconds=30 to the frontend Deployment.
-#    This means kubectl rollout status completes ~30s LATER than before —
-#    the pod passes readiness probe, then waits 30 more seconds before the
-#    rollout considers it Available. We now wait 150s (was 120s) for frontend
-#    to give this window room without false timeout warnings.
+# [v5] metrics-server source consolidated to cluster/metrics-server.yaml.
+#      infrastructure.yaml previously deployed metrics-server AND kube-state-metrics
+#      together, making it the dual source of truth that caused the immutable
+#      selector conflict on resume. Now:
+#        - cluster/metrics-server.yaml  → metrics-server only (kube-system)
+#        - infrastructure.yaml          → kube-state-metrics + node-exporter only
+#      resume() already applies cluster/metrics-server.yaml. Now start.sh matches.
 #
-# 2. Backend dependency pre-check added before frontend wait.
-#    Redis, cartservice, and productcatalogservice are waited on BEFORE
-#    declaring frontend ready. Previously a slow .NET cartservice startup
-#    would cause frontend to pass readiness but return 500s on /cart.
-#    New order: redis → cart → productcatalog → frontend.
-#    This makes start.sh's "boutique ready" declaration honest.
+# [v5] Local registry check added (was start_sh_patch.txt — now merged in).
+#      The patched frontend image (avoidNoopCurrencyConversionRPC=true) lives
+#      in a local Docker registry on :5001. Without this check, boutique deploy
+#      fails silently with ImagePullBackOff on the frontend pod.
+#      registry check runs BEFORE boutique apply, with clear rebuild instructions
+#      if the image is missing after a reboot.
 #
-# 3. Port-forward health check URL changed: localhost:30080 → localhost:8080.
-#    NodePort 30080 is unreliable on Docker Desktop. The LoadBalancer path
-#    (port 8080) is the correct primary URL. find-url.sh confirmed this.
-#
-# 4. Final status section now runs find-url.sh to print the verified URL.
-#    Previously it printed static text — now it prints the URL that actually works.
-#
-# KEY CHANGES v4:
-#
-# 5. wait_warm_gate() added — end-to-end HTTP verification before "STACK IS UP".
-#    Previous versions declared the stack ready based on kubectl rollout status,
-#    which only checks that pods passed /_healthz (the frontend HTTP server).
-#    /_healthz does NOT check gRPC backend connectivity. The result: frontend is
-#    "ready" while cartservice (.NET JIT ~45s), productcatalog, and currency are
-#    still warming up → first real requests return 500s for up to 90s.
-#    New gate: poll GET / until HTTP 200 with body containing "Hot Products" —
-#    this requires productcatalog + currency + recommendation to all respond.
-#    Only then print STACK IS UP. Demo starts clean. Zero cold-start 500s visible.
-#
-# 6. wait_backends_warm() added before frontend wait.
-#    Polls cartservice :7070 and productcatalogservice :3550 TCP sockets directly
-#    from within the cluster (via kubectl exec on a running pod) to confirm the
-#    gRPC servers are accepting connections — not just that pods passed their own
-#    probes. Prevents the 30-60s window where frontend is Ready but returns 500s
-#    because its backends have not finished JIT/import warmup.
-#
-# 7. Section 9 renamed "9. Warm gate + Final status" to make the gate visible
-#    in the startup log. The gate prints elapsed wait time so the operator knows
-#    how long backends took — useful data for demo timing.
+# [v4] wait_warm_gate() — end-to-end HTTP verification before "STACK IS UP".
+# [v4] wait_tcp_ready() — TCP probe from inside cluster before frontend wait.
+# [v3] NodePort → LoadBalancer :8080 as primary URL.
+# [v3] find-url.sh for verified URL discovery.
+# [v2] minReadySeconds=30 accounted for in frontend wait timeout.
+# [v2] redis → cart → productcatalog → frontend startup order.
 # =============================================================================
 
 set -euo pipefail
@@ -124,20 +106,6 @@ wait_ready_kind() {
   fi
 }
 
-wait_http() {
-  local url=$1 timeout_sec=${2:-120} label=${3:-$1}
-  info "Waiting for $label to respond (up to ${timeout_sec}s)..."
-  local elapsed=0
-  while ! curl -sf "$url" -o /dev/null -m 5 2>/dev/null; do
-    sleep 5; elapsed=$((elapsed + 5))
-    if [[ $elapsed -ge $timeout_sec ]]; then
-      warn "$label did not respond after ${timeout_sec}s"
-      return 1
-    fi
-  done
-  info "$label is up ✓"
-}
-
 start_port_forward() {
   local ns=$1 svc=$2 local_port=$3 remote_port=$4 health_url=$5
   local log_file="/tmp/pf-${svc}.log"
@@ -157,9 +125,9 @@ start_port_forward() {
   info "Port-forward $svc:$local_port ready ✓"
 }
 
-# ── Backend TCP warm check (run from kubectl exec inside cluster) ─────────────
-# Polls a TCP port directly from a running pod — verifies the gRPC server is
-# accepting connections, not just that the pod passed its own readiness probe.
+# ── Backend TCP warm check ────────────────────────────────────────────────────
+# Probes a TCP port from inside the cluster (via redis pod exec).
+# Confirms gRPC servers are accepting connections, not just that readiness passed.
 wait_tcp_ready() {
   local host=$1 port=$2 label=${3:-$1:$2} timeout_sec=${4:-120}
   info "Verifying $label gRPC port is warm (up to ${timeout_sec}s)..."
@@ -183,9 +151,9 @@ wait_tcp_ready() {
 }
 
 # ── End-to-end HTTP warm gate ─────────────────────────────────────────────────
-# Polls GET / until HTTP 200 with real product page content.
+# Polls GET / until HTTP 200 with real product content.
 # Requires productcatalog + currency + recommendation all responding.
-# This is the HONEST "stack is ready" signal — not just "pods are scheduled".
+# This is the honest "stack is ready" signal — not just "pods are scheduled".
 wait_warm_gate() {
   local url=$1 timeout_sec=${2:-180}
   info "Warm gate: polling $url/ until real product page returns (up to ${timeout_sec}s)..."
@@ -202,7 +170,6 @@ wait_warm_gate() {
         info "Warm gate PASSED — homepage returned real product data ✓ (${elapsed}s)"
         return 0
       fi
-      # After 30s of 200s, accept it even if grep misses (CDN/cache variations)
       if [[ $elapsed -ge 30 ]]; then
         info "Warm gate PASSED — HTTP 200 sustained ✓ (${elapsed}s)"
         return 0
@@ -248,6 +215,8 @@ fi
 
 section "0. Preflight"
 command -v kubectl &>/dev/null || { error "kubectl not found"; exit 1; }
+command -v k6     &>/dev/null || warn "k6 not found — load tests will fail (brew install k6)"
+command -v docker &>/dev/null || warn "docker not found — local registry check will be skipped"
 kubectl cluster-info &>/dev/null || { error "cluster unreachable — is Docker Desktop running?"; exit 1; }
 info "Cluster: $(kubectl config current-context)"
 
@@ -264,12 +233,26 @@ kubectl apply -f namespaces/priority-classes.yaml
 kubectl apply -f namespaces/namespaces.yaml
 info "PriorityClasses and namespaces ready ✓"
 
-section "2. Observability infrastructure"
-kubectl apply -f observability/infrastructure/infrastructure.yaml
+section "2. metrics-server"
+# Single source of truth: cluster/metrics-server.yaml
+# If selector label conflicts (immutable field), delete+recreate deployment only.
+if ! kubectl apply -f cluster/metrics-server.yaml 2>/dev/null; then
+  warn "metrics-server apply failed (immutable selector) — forcing recreate..."
+  kubectl delete deployment metrics-server -n kube-system --ignore-not-found 2>/dev/null
+  kubectl apply -f cluster/metrics-server.yaml
+fi
 wait_ready_kind deployment metrics-server kube-system 120 || \
-  warn "metrics-server slow — HPA may not work initially"
+  warn "metrics-server slow — HPA targets may show <unknown> initially"
 
-section "3. Core observability stack"
+section "3. Observability infrastructure (kube-state-metrics + node-exporter)"
+# infrastructure.yaml deploys kube-state-metrics and node-exporter ONLY.
+# metrics-server is handled above from cluster/metrics-server.yaml.
+kubectl apply -f observability/infrastructure/infrastructure.yaml
+kubectl rollout status deployment/kube-state-metrics -n observability \
+  --timeout=120s 2>/dev/null && info "kube-state-metrics ✓" || \
+  warn "kube-state-metrics slow"
+
+section "4. Core observability stack"
 kubectl apply -f observability/prometheus/prometheus.yaml
 kubectl apply -f observability/loki/loki.yaml
 kubectl apply -f observability/tempo/tempo.yaml
@@ -281,7 +264,7 @@ info "Loki and Tempo starting in background..."
 kubectl rollout status deployment/loki  -n observability --timeout=120s 2>/dev/null &
 kubectl rollout status deployment/tempo -n observability --timeout=120s 2>/dev/null &
 
-section "4. Alloy (trace + log collector)"
+section "5. Alloy (trace + log collector)"
 kubectl apply -f observability/alloy/alloy.yaml
 
 info "Waiting for Alloy DaemonSet (up to 390s — cold start can take 2-3 min)..."
@@ -297,35 +280,64 @@ for i in $(seq 1 78); do
   fi
   sleep 5
 done
-if $alloy_ready; then
-  info "Alloy ready ✓"
-else
-  warn "Alloy not fully ready after 390s — check: kubectl logs -n observability daemonset/alloy --tail=40"
-fi
+$alloy_ready && info "Alloy ready ✓" || \
+  warn "Alloy not fully ready — check: kubectl logs -n observability daemonset/alloy --tail=40"
 
-section "5. Grafana"
+section "6. Grafana"
 kubectl apply -f observability/grafana/grafana.yaml
 wait_ready_kind deployment grafana observability 180 || \
   warn "Grafana still pulling image — boutique will deploy now."
 
 wait || true
 
-section "6. Boutique application"
+section "7. Local registry (patched frontend image)"
+# The frontend is built with avoidNoopCurrencyConversionRPC=true to eliminate
+# the 10× currency RPC fan-out. It lives in a local Docker registry on :5001.
+# Without this image, the frontend pod will ImagePullBackOff silently.
+if command -v docker &>/dev/null; then
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^local-registry$"; then
+    info "Local registry already running ✓"
+  else
+    info "Starting local registry on :5001..."
+    docker run -d -p 5001:5000 --name local-registry registry:2 2>/dev/null || \
+      docker start local-registry 2>/dev/null || true
+    sleep 2
+  fi
+
+  if docker manifest inspect localhost:5001/boutique-frontend:arm64-v1 &>/dev/null 2>&1; then
+    info "Patched frontend image verified in registry ✓"
+  else
+    warn "Patched frontend image NOT found in registry."
+    warn "Frontend pod will fail with ImagePullBackOff until this is resolved."
+    warn ""
+    warn "If image was lost after reboot, rebuild:"
+    warn "  cd /tmp/boutique-patch"
+    warn "  docker buildx build --platform linux/arm64 \\"
+    warn "    --build-arg TARGETARCH=arm64 --build-arg TARGETOS=linux \\"
+    warn "    --load -t boutique-frontend:arm64-v1 src/frontend/"
+    warn "  docker tag boutique-frontend:arm64-v1 localhost:5001/boutique-frontend:arm64-v1"
+    warn "  docker push localhost:5001/boutique-frontend:arm64-v1"
+    warn ""
+    warn "Continuing — other services will come up normally."
+  fi
+else
+  warn "docker not found — skipping local registry check"
+fi
+
+section "8. Boutique application"
 kubectl apply -f boutique/boutique.yaml
 
-# Wait for the dependency chain in order — this order matters.
-# Redis must be ready before cartservice can connect.
-# Cart must be ready before frontend stops returning 500s on /cart.
-# productcatalog must be ready before frontend stops returning 500s on homepage.
-# minReadySeconds=30 on frontend means rollout status completes 30s after
-# the readiness probe passes — by then all backends should be warm.
+# Wait in dependency order — this order matters:
+#   Redis must be ready before cartservice can connect.
+#   Cart must be ready before frontend stops returning 500s on /cart.
+#   productcatalog must be ready before frontend stops returning 500s on homepage.
+#   minReadySeconds=30 on frontend means rollout status completes 30s after
+#   the readiness probe passes.
 
 info "Waiting for Redis..."
 wait_ready_kind deployment redis boutique 60 || warn "Redis slow to start"
 
-# Cart runs in background — don't block the rest of startup on .NET JIT.
-# Its startupProbe (135s window) handles the JIT warmup gate independently.
-# Frontend minReadySeconds=30 gives cart additional buffer before traffic arrives.
+# Cart runs in background — don't block on .NET JIT (startupProbe handles it).
 info "Cartservice starting in background (.NET JIT — non-blocking)..."
 kubectl rollout status deployment/cartservice -n boutique --timeout=150s 2>/dev/null &
 CART_PID=$!
@@ -335,10 +347,9 @@ wait_ready_kind deployment productcatalogservice boutique 90 || \
   warn "productcatalogservice slow to start"
 
 info "Waiting for frontend (includes minReadySeconds=30 gate — up to 150s)..."
-# 150s = 15s startup probe + 30s minReadySeconds + 30s image pull buffer
 wait_ready_kind deployment frontend boutique 150 || warn "Frontend slow to start"
 
-# All other services in background — not in the critical request path for homepage
+# All other services in background — not in the critical path for homepage
 for svc in emailservice recommendationservice shippingservice \
            paymentservice currencyservice adservice checkoutservice; do
   kubectl rollout status "deployment/$svc" -n boutique --timeout=180s 2>/dev/null &
@@ -346,10 +357,9 @@ done
 wait || true
 info "All boutique services scheduled ✓"
 
-# Collect cart background wait — it had its chance, HPA needs it ready
 wait $CART_PID 2>/dev/null || warn "Cartservice may still be pulling image — HPA will retry"
 
-section "7. HPA"
+section "9. HPA"
 if kubectl top nodes &>/dev/null 2>&1; then
   info "metrics-server is returning data — applying HPA"
   kubectl apply -f boutique/hpa.yaml
@@ -360,7 +370,7 @@ else
   warn "Run 'kubectl get hpa -n boutique' in 60s to verify HPA has CPU metrics"
 fi
 
-section "8. Port-forwards (observability)"
+section "10. Port-forwards"
 pkill -f "kubectl port-forward" 2>/dev/null || true
 [[ -f "$PF_PID_FILE" ]] && rm "$PF_PID_FILE"
 touch "$PF_PID_FILE"
@@ -369,9 +379,8 @@ for pf in "${PF_DEFS[@]}"; do
   start_port_forward "$ns" "$svc" "$lp" "$rp" "$url"
 done
 
-section "9. Warm gate + Final status"
+section "11. Warm gate + Final status"
 
-# Port-forward must be up before warm gate can poll localhost
 WORKING_URL=$(bash "$SCRIPT_DIR/find-url.sh" --export 2>/dev/null || echo "http://localhost:8080")
 
 echo ""
@@ -393,7 +402,6 @@ echo -e "${GREEN}═════════════════════
 echo -e "${GREEN} STACK IS UP AND WARM (gate took ${gate_elapsed}s)${NC}"
 echo -e "${GREEN}═══════════════════════════════════════════════${NC}"
 echo ""
-
 echo "  Boutique:   $WORKING_URL"
 echo "  Grafana:    http://localhost:3000    admin/admin"
 echo ""

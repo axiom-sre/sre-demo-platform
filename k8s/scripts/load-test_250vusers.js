@@ -8,7 +8,7 @@
  * USAGE   : k6 run scripts/load-test_250vusers.js
  *
  * EXPECTED HPA AT PLATEAU (250 VU):
- *   currencyservice  → 6 pods  (maxed — this is expected and fine)
+ *   currencyservice  → 10 pods  (maxed — this is expected and fine)
  *   frontend         → 4-6 pods
  *   productcatalog   → 3-4 pods
  *   recommendation   → 3-4 pods

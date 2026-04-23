@@ -1,3 +1,23 @@
+# cluster/kind-cluster.yaml — Future Use (NOT active on Docker Desktop)
+# =============================================================================
+# This file defines a 3-node Kind cluster for when the platform is migrated
+# off Docker Desktop to a local Kind cluster (e.g. for CI or multi-node testing).
+#
+# CURRENT SETUP: Docker Desktop single-node Kubernetes.
+# This file is NOT applied by any script. It is kept here for reference.
+#
+# To use with Kind (future):
+#   kind create cluster --config cluster/kind-cluster.yaml
+#   Then run: bash scripts/bootstrap.sh
+#
+# DIFFERENCES vs Docker Desktop:
+#   - 3 nodes: 1 control-plane + 2 workers (boutique + monitoring labels)
+#   - NodePort mappings exposed via extraPortMappings (Docker Desktop uses
+#     LoadBalancer → localhost natively, so these aren't needed there)
+#   - Cluster name: finflow (rename to sre-demo when activating)
+#   - Port-forwards in start.sh still work on Kind — no script changes needed
+# =============================================================================
+
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 name: finflow
@@ -44,7 +64,6 @@ nodes:
           kubeletExtraArgs:
             node-labels: "workload=monitoring"
 
-# Networking
 networking:
   podSubnet: "10.244.0.0/16"
   serviceSubnet: "10.96.0.0/16"
