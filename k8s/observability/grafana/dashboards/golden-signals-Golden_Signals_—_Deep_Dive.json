@@ -978,13 +978,13 @@
     "list": []
   },
   "time": {
-    "from": "now-15m",
+    "from": "now-30m",
     "to": "now"
   },
   "timepicker": {},
   "timezone": "",
   "title": "Golden Signals \u2014 Deep Dive",
   "uid": "golden-signals",
-  "version": 25,
+  "version": 26,
   "weekStart": ""
 }

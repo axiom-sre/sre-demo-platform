@@ -645,7 +645,7 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 9,
+        "h": 8,
         "w": 12,
         "x": 0,
         "y": 7
@@ -750,7 +750,7 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 9,
+        "h": 8,
         "w": 12,
         "x": 12,
         "y": 7
@@ -849,10 +849,10 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
+        "h": 7,
         "w": 24,
         "x": 0,
-        "y": 16
+        "y": 15
       },
       "id": 30,
       "options": {
@@ -864,7 +864,9 @@
           ],
           "displayMode": "table",
           "placement": "right",
-          "showLegend": true
+          "showLegend": true,
+          "sortBy": "Last *",
+          "sortDesc": true
         },
         "tooltip": {
           "mode": "multi",
@@ -1078,7 +1080,7 @@
                     },
                     {
                       "color": "red",
-                      "value": 11
+                      "value": 10
                     }
                   ]
                 }
@@ -1235,7 +1237,7 @@
         "h": 10,
         "w": 24,
         "x": 0,
-        "y": 24
+        "y": 22
       },
       "id": 40,
       "options": {
@@ -1311,7 +1313,7 @@
         "h": 11,
         "w": 24,
         "x": 0,
-        "y": 34
+        "y": 32
       },
       "id": 31,
       "options": {
@@ -1510,7 +1512,7 @@
         "h": 10,
         "w": 24,
         "x": 0,
-        "y": 45
+        "y": 43
       },
       "id": 50,
       "options": {
@@ -1599,7 +1601,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 55
+        "y": 53
       },
       "id": 60,
       "options": {
@@ -1644,6 +1646,6 @@
   "timezone": "",
   "title": "SRE Command Center",
   "uid": "command-center",
-  "version": 40,
+  "version": 43,
   "weekStart": ""
 }

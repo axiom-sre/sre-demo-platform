@@ -190,7 +190,7 @@
                     },
                     {
                       "color": "red",
-                      "value": 11
+                      "value": 10
                     }
                   ]
                 }
@@ -941,8 +941,8 @@
           "displayMode": "table",
           "placement": "bottom",
           "showLegend": true,
-          "sortBy": "Last *",
-          "sortDesc": false
+          "sortBy": "Max",
+          "sortDesc": true
         },
         "tooltip": {
           "mode": "single",
@@ -1164,7 +1164,6 @@
           "color": {
             "mode": "thresholds"
           },
-          "decimals": 0,
           "mappings": [
             {
               "options": {
@@ -1573,13 +1572,13 @@
     "list": []
   },
   "time": {
-    "from": "now-30m",
+    "from": "now-1h",
     "to": "now"
   },
   "timepicker": {},
   "timezone": "",
   "title": "Platform & HPA",
   "uid": "platform-stats",
-  "version": 36,
+  "version": 40,
   "weekStart": ""
 }
