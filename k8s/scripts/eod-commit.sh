@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # eod-commit.sh — End-of-Day Git Snapshot
-# SRE Holy Grail Demo · ~/sre
+# SRE Master Demo · ~/sre
 #
 # Usage:
 #   bash scripts/eod-commit.sh                  # auto-generates commit message
