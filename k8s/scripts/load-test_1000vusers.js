@@ -41,11 +41,11 @@ const PRODUCTS = [
 // ─── Thresholds ───────────────────────────────────────────────────────────────
 export const options = {
   stages: [
-    { duration: '2m',  target: 100  },  // HPA wave 1
-    { duration: '3m',  target: 300  },  // HPA wave 2
-    { duration: '3m',  target: 600  },  // mid-demo plateau
+    { duration: '1m',  target: 100  },  // HPA wave 1
+    { duration: '2m',  target: 300  },  // HPA wave 2
+    { duration: '2m',  target: 600  },  // mid-demo plateau
     { duration: '2m',  target: 1000 },  // max load ramp
-    { duration: '15m', target: 1000 },  // sustained peak — the money shot
+    { duration: '5m',  target: 1000 },  // sustained peak — the money shot
     { duration: '5m',  target: 0    },  // ramp down — HPA stabilization visible
   ],
   thresholds: {

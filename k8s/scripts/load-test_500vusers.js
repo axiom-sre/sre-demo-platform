@@ -1,26 +1,32 @@
 /**
- * load-test_100vusers.js — SRE Demo: 100 VU Multi-HPA Cascade
- * ─────────────────────────────────────────────────────────────
- * PURPOSE : Validate full HPA cascade before stepping to 250+.
- *           All 6 HPAs should fire by minute 5. Run for 20min minimum.
- * PASS    : <0.5% failures, p95 < 1000ms sustained.
- * USAGE   : k6 run scripts/load-test_100vusers.js
+ * load-test_250vusers.js — SRE Demo: 250 VU Stress Test
+ * ──────────────────────────────────────────────────────
+ * PURPOSE : Stepping stone between 100 VU and 1000 VU. Validates that
+ *           HPA cascade handles sustained mid-tier load. All services
+ *           should hit their scaled replica counts and hold them.
+ * PASS    : <0.5% failures, p95 < 1500ms.
+ * USAGE   : k6 run scripts/load-test_250vusers.js
  *
- * EXPECTED HPA SEQUENCE (watch: kubectl get hpa -n boutique -w):
- *   ~1min  currencyservice  2→3  (every page render, fires first)
- *   ~2min  frontend         2→4  (Go proxy — scales on connection count)
- *   ~3min  productcatalog   2→3  (browse traffic)
- *   ~3min  recommendation   2→3  (browse traffic)
- *   ~4min  cartservice      2→3  (cart abandoners — 60s stabilisation window)
- *   ~5min  checkoutservice  2→3  (checkout burst — 10% of traffic)
+ * EXPECTED HPA AT PLATEAU (250 VU):
+ *   currencyservice  → 10 pods  (maxed — this is expected and fine)
+ *   frontend         → 4-6 pods
+ *   productcatalog   → 3-4 pods
+ *   recommendation   → 3-4 pods
+ *   cartservice      → 3 pods
+ *   checkoutservice  → 2-3 pods
  *
  * WHAT TO WATCH IN GRAFANA:
- *   - Platform & HPA:   replica gauges stepping up in sequence
- *   - Golden Signals:   error rate flat 0%, RPS stable plateau
- *   - SLO dashboard:    burn rate <1x throughout
- *   - Infra & Node:     node CPU 30-50% — healthy headroom for 250 VU
+ *   - Platform & HPA:  all 6 services scaled, gauges in amber/green zone
+ *   - Golden Signals:  0% errors, p95 stable under 500ms with pods scaled
+ *   - Infra & Node:    node CPU 40-60% — confirms headroom exists for 1000 VU
+ *   - SLO dashboard:   burn rate <1x — budget-neutral at this load level
  *
- * THINK TIMES: 1-2s throughout — tight to generate enough RPS at 100 VU.
+ * THINK TIMES: 1-2s — kept tight. At 250 VU with 2s think time each VU
+ * generates ~0.4 req/s, so 250 VU = ~100 req/s baseline before bursts.
+ * This is the realistic load profile for the HPA to respond to.
+ *
+ * NOTE: maxConnectionsPerHost added at this VU count. Docker Desktop's NAT
+ * table starts showing contention above ~200 simultaneous connections.
  */
 
 import http from 'k6/http';
@@ -30,7 +36,7 @@ const BASE = __ENV.BASE_URL || 'http://localhost:8080';
 
 const P = {
   timeout: '30s',
-  tags: { test: '100vu' },
+  tags: { test: '250vu' },
 };
 
 const PRODUCTS = [
@@ -40,15 +46,18 @@ const PRODUCTS = [
 
 export const options = {
   stages: [
-    { duration: '2m',  target: 100 },  // ramp — HPA wave 1 fires here
-    { duration: '5m', target: 100 },  // sustain — full cascade + steady state
-    { duration: '2m',  target: 0   },  // ramp down — watch 5min scaleDown hold
+    { duration: '2m',  target: 500 },  // ramp — HPA cascade fires
+    { duration: '5m',  target: 500 },  // sustain — stable plateau
+    { duration: '2m',  target: 0   },  // ramp down — watch scaleDown hold
   ],
   thresholds: {
     http_req_failed:   ['rate<0.005'],
-    http_req_duration: ['p(95)<1000'],
-    'http_req_duration{expected_response:true}': ['p(99)<3000'],
+    http_req_duration: ['p(95)<1500'],
+    'http_req_duration{expected_response:true}': ['p(99)<4000'],
   },
+  // Prevent k6 from overwhelming Docker Desktop NAT table at 250+ VU.
+  // Without this, connection resets appear as app errors — they're not.
+  maxConnectionsPerHost: 50,
   summaryTrendStats: ['avg', 'min', 'med', 'max', 'p(90)', 'p(95)', 'p(99)'],
 };
 
@@ -90,9 +99,9 @@ export default function () {
     if (persona >= 0.1) return;
 
     const co = http.post(`${BASE}/cart/checkout`, {
-      email:                        'sre-100vu@example.com',
-      street_address:               '100 Load Ave',
-      zip_code:                     '10100',
+      email:                        'sre-250vu@example.com',
+      street_address:               '250 Load Ave',
+      zip_code:                     '10250',
       city:                         'ClusterCity',
       state:                        'CA',
       country:                      'US',

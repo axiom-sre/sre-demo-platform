@@ -1,8 +1,41 @@
-# boutique/boutique.yaml — Holy Grail Edition v6
+# boutique/boutique.yaml — Holy Grail Edition v7
 # =============================================================================
-# KEY CHANGES vs v5:
+# KEY CHANGES vs v7:
 #
-# [FIX 1 — ResourceQuota removed from this file]
+# [FIX 1_v7 — shippingservice CPU request: 15m → 50m]
+#   Root cause: 15m request → 9m HPA trigger (60% × 15m) — false-scaled immediately.
+#   At 1000 VU all checkout goroutines serialised through one pod → 15s p99.
+#   Fix: 15m→50m, trigger now 30m (60% × 50m). New HPA added in hpa.yaml v4.
+#
+# [FIX 2_v7 — paymentservice CPU request: 15m → 50m]
+#   Identical root cause as shippingservice. Single replica, 9m trigger = bottleneck.
+#   Fix: 15m→50m, trigger now 30m. New HPA added in hpa.yaml v4.
+#
+# [FIX 3_v7 — checkoutservice CPU request: 25m → 100m]
+#   I/O-bound fan-out — 13m trigger never fired. 2 pods blocked on 7 downstream calls.
+#   Fix: 25m→100m raises trigger to 60m. minReplicas 2→3, maxReplicas 6→8 in hpa.yaml.
+#
+# [FIX 4_v7 — productcatalogservice CPU request: 30m → 60m]
+#   15m trigger caused false-scaling at low VU. Doubled request → trigger now 30m.
+#
+# [Fix 5_v8: currencyservice CPU limit 100m → 300m]
+#   Root cause: 100m limit caused cgroup CPU throttling at high fan-out.
+#   Pods were THROTTLED not SATURATED. HPA never saw high utilization.
+#   Fix: raise limit so pods can actually use their allocated CPU.
+#   Request stays at 50m — HPA trigger (60% × 50m = 30m) unchanged.
+#
+# [Fix 6_v8: frontend CPU limit 2000m → 4000m + GOMAXPROCS env var]
+#   Go's GOMAXPROCS defaults to the node's physical CPU count inside a
+#   container, ignoring cgroup CPU limits. On an M5 Pro (12 cores) this
+#   means Go spawns 12 OS threads but cgroup allows only 2000m (2 cores).
+#   Result: constant CPU throttling at the cgroup level even at low load.
+#   Fix 1: Set GOMAXPROCS=4 explicitly — matches 4000m limit / 1000 = 4 cores.
+#   Fix 2: Raise limit to 4000m — frontend is the customer-facing entrypoint,
+#          deserves more headroom than background services.
+#
+# KEY CHANGES vs v5 (carried forward from v6):
+#
+# [FIX 6 — ResourceQuota removed from this file]
 #   Root cause: boutique.yaml and namespaces.yaml both defined boutique-quota.
 #   Whichever was applied last won. boutique.yaml's "4" CPU quota was winning
 #   in the live cluster, blocking HPA from scheduling pods at 5K VU.
@@ -31,27 +64,31 @@
 #   boutique namespace is owned by namespaces/namespaces.yaml.
 #   Duplicate declaration here caused confusion about which file owns it.
 #
-# NODE BUDGET MATH (v6 — updated for correct currency maxReplicas=10):
+# NODE BUDGET MATH (v7 — all services right-sized, shipping/payment HPAs added):
 #   frontend:      10 × 50m  =  500m
-#   productcat:     6 × 30m  =  180m
+#   productcat:     8 × 60m  =  480m   ← request 30m→60m
 #   cart:           5 × 50m  =  250m
-#   checkout:       6 × 25m  =  150m
-#   currency:      10 × 15m  =  150m   ← was showing 6 in v5 header (stale)
-#   recommend:      5 × 25m  =  125m
+#   checkout:       8 × 100m =  800m   ← request 25m→100m, min 2→3, max 6→8
+#   currency:      12 × 50m  =  600m   ← request 15m→50m, max 10→12
+#   recommend:      8 × 25m  =  200m   ← max 5→8 (Python GIL, pods are the fix)
+#   shipping:       6 × 50m  =  300m   ← NEW HPA, request 15m→50m
+#   payment:        6 × 50m  =  300m   ← NEW HPA, request 15m→50m
 #   adservice:      1 × 30m  =   30m   (no HPA — JVM startup cost too high)
-#   fixed services (redis/email/payment/shipping): ~155m
-#   Total boutique at max HPA:  ~1540m requests
+#   fixed (redis/email): ~60m
+#   Total boutique at max HPA:  ~3520m requests
 #   Observability stack:         ~800m
 #   kube-system:                 ~400m
-#   Grand total:                ~2740m / 8000m = 34% — massive headroom ✓
+#   Grand total:                ~4720m / ~48000m M5 Pro = ~10% — ample headroom ✓
 #
-# [1000 VU VALIDATED RESULTS — carried forward from v5]
+# [1000 VU VALIDATED RESULTS — v6, pre shipping/payment HPA fix]
 #   p95: 660ms  (threshold: 2000ms) — 3× under
-#   p99: 1.2s   (threshold: 8000ms) — 6× under
+#   p99: 1.2s   (threshold: 8000ms) — 6× under (degraded to 15s on checkout pre-fix)
 #   errors: 0.07% → 0.00% after minReadySeconds fix
 #   availability: 99.997%
 #   node CPU at peak: 10.4% of M5 Pro 8 vCPU
 #   Active boutique pods at peak: 31
+#
+# [1000 VU v7 RESULTS — pending retest with shipping/payment/checkout fixes]
 # =============================================================================
 
 # =============================================================================
@@ -387,11 +424,11 @@ spec:
             timeoutSeconds: 5
           resources:
             requests:
-              cpu: 50m        # observed: 1m idle. HPA fires at 9m (60% × 15m)
+              cpu: 50m        # observed: 1m idle. HPA fires at 30m (60% × 50m). was 15m → OOMKill fix
               memory: 256Mi   # was 64Mi — observed 97Mi at 1000 VU; OOMKill risk fixed
             limits:
-              cpu: 100m
-              memory: 256Mi   # was 128Mi — doubled to eliminate OOMKill at peak load
+              cpu: 300m
+              memory: 256Mi   # was 256Mi — doubled to eliminate OOMKill at peak load
 ---
 apiVersion: v1
 kind: Service
@@ -881,7 +918,7 @@ metadata:
   labels:
     app: checkoutservice
 spec:
-  replicas: 2
+  replicas: 4         # WAS: 2 — must match HPA minReplicas=4
   progressDeadlineSeconds: 180
   selector:
     matchLabels:
@@ -982,7 +1019,7 @@ metadata:
   labels:
     app: frontend
 spec:
-  replicas: 2
+  replicas: 3 # starting replicas increase 3 from 2 to handle higher load
   progressDeadlineSeconds: 300
   # minReadySeconds: frontend is Ready when /_healthz returns 200 (HTTP server only).
   # Backend gRPC connections take 30s more. This gates traffic until backends warm.
@@ -1039,6 +1076,8 @@ spec:
               value: "adservice.boutique.svc.cluster.local:9555"
             - name: SHOPPING_ASSISTANT_SERVICE_ADDR
               value: "shoppingassistantservice.boutique.svc.cluster.local:80"
+            - name: GOMAXPROCS
+              value: "4"
           ports:
             - containerPort: 8080
           startupProbe:
@@ -1078,7 +1117,7 @@ spec:
               cpu: 50m        # observed: 1-5m idle. HPA fires at 25m (50% × 50m).
               memory: 128Mi   # actual ~27-68Mi. Headroom for goroutine burst.
             limits:
-              cpu: 2000m      # keep: frontend can spike hard under load
+              cpu: 4000m      # WAS: 2000m — matches GOMAXPROCS=4 × 1000m/core
               memory: 512Mi
 ---
 apiVersion: v1

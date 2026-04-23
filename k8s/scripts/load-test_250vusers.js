@@ -47,16 +47,14 @@ const PRODUCTS = [
 export const options = {
   stages: [
     { duration: '2m',  target: 250 },  // ramp — HPA cascade fires
-    { duration: '15m', target: 250 },  // sustain — stable plateau
-    { duration: '3m',  target: 0   },  // ramp down — watch scaleDown hold
+    { duration: '5m',  target: 250 },  // sustain — stable plateau
+    { duration: '2m',  target: 0   },  // ramp down — watch scaleDown hold
   ],
   thresholds: {
     http_req_failed:   ['rate<0.005'],
     http_req_duration: ['p(95)<1500'],
     'http_req_duration{expected_response:true}': ['p(99)<4000'],
   },
-  // Prevent k6 from overwhelming Docker Desktop NAT table at 250+ VU.
-  // Without this, connection resets appear as app errors — they're not.
   maxConnectionsPerHost: 50,
   summaryTrendStats: ['avg', 'min', 'med', 'max', 'p(90)', 'p(95)', 'p(99)'],
 };

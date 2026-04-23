@@ -227,6 +227,7 @@ spec:
             - --config.file=/etc/prometheus/prometheus.yml
             - --storage.tsdb.path=/prometheus
             - --storage.tsdb.retention.time=72h
+            - --storage.tsdb.retention.size=8GB
             - --storage.tsdb.wal-compression
             - --storage.tsdb.min-block-duration=2h
             - --storage.tsdb.max-block-duration=4h
@@ -263,10 +264,10 @@ spec:
           resources:
             requests:
               cpu: 400m     # raised from 300m — 50k series + spanmetrics steady state
-              memory: 512Mi
+              memory: 1Gi
             limits:
               cpu: 2000m
-              memory: 2Gi
+              memory: 4Gi
       volumes:
         - name: config
           configMap:

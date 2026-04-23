@@ -164,10 +164,10 @@ data:
       endpoint {
         url = "http://prometheus.observability.svc.cluster.local:9090/api/v1/write"
         queue_config {
-          capacity             = 200000
+          capacity             = 50000
           max_samples_per_send = 10000
-          max_shards           = 32
-          min_shards           = 8
+          max_shards           = 16
+          min_shards           = 4
           batch_send_deadline  = "10s"
           // Explicit backoff: recover faster from Prometheus WAL/compaction pauses
           min_backoff          = "1s"
@@ -197,7 +197,7 @@ data:
       sending_queue {
         enabled       = true
         num_consumers = 8
-        queue_size    = 8000
+        queue_size    = 2000
       }
     }
 
@@ -370,7 +370,7 @@ spec:
                 fieldRef:
                   fieldPath: spec.nodeName
             - name: GOMEMLIMIT
-              value: "1395864371"    # 1.3Gi — hard memory ceiling for Go runtime
+              value: "1825361100"    # 1.3Gi — hard memory ceiling for Go runtime
             - name: GOGC
               value: "75"            # Fire GC at 175% (vs default 200%) — keeps heap tighter
           ports:
@@ -425,10 +425,10 @@ spec:
           resources:
             requests:
               cpu: 600m      # raised from 500m — measured 550-580m at 1000 VU steady state
-              memory: 512Mi
+              memory: 768Mi
             limits:
               cpu: 2000m
-              memory: 1536Mi
+              memory: 2Gi
       volumes:
         - name: config
           configMap:
