@@ -32,9 +32,31 @@
 #   16 CPU requests is fine because limits (32) are the actual safety net.
 #   The scheduler uses requests for bin-packing, not limits.
 #
-# OBSERVABILITY namespace:
-#   Prometheus + Loki + Tempo + Grafana + Alloy + kube-state-metrics
-#   Kept conservative — observability must not starve boutique.
+# OBSERVABILITY namespace — v2 quota rationale:
+#   The original 12Gi limits / 4Gi requests quota was calculated before
+#   Tempo was raised to 3Gi (OOMKill fix) and Prometheus kept at 4Gi.
+#   At 9.6Gi used, Prometheus could not restart after a rolling update
+#   because the new replicaset needed 4Gi → total would exceed 12Gi.
+#
+#   Component breakdown (limits):
+#     Alloy            2Gi
+#     Grafana          1Gi
+#     kube-state-metrics 256Mi
+#     Loki             1Gi
+#     node-exporter    128Mi
+#     Prometheus       4Gi
+#     Tempo            3Gi
+#     ─────────────────────
+#     Subtotal:       ~11.4Gi
+#
+#   20Gi gives headroom for:
+#     - Prometheus rolling restarts (brief double-count of 4Gi limit)
+#     - Pyroscope profiler (Day 13 roadmap) ~1Gi
+#     - Alertmanager (Day 4 roadmap)        ~256Mi
+#     - Any future additions without hitting quota again
+#
+#   requests.cpu raised 3→6: Prometheus + Alloy at 1000VU steady state
+#   consume ~1.9Gi requests together. 6 gives room for Pyroscope + AM.
 # =============================================================================
 
 apiVersion: v1
@@ -52,11 +74,11 @@ metadata:
   namespace: boutique
 spec:
   hard:
-    requests.cpu: "16"      # ceiling — HPA can scale all services to max simultaneously
-    limits.cpu: "32"        # hard safety net against node saturation
-    requests.memory: "20Gi" # generous — M5 Pro has 64GB, memory is not the constraint
+    requests.cpu: "16"       # ceiling — HPA can scale all services to max simultaneously
+    limits.cpu: "32"         # hard safety net against node saturation
+    requests.memory: "20Gi"  # generous — M5 Pro has 64GB, memory is not the constraint
     limits.memory: "40Gi"
-    pods: "60"              # prevents runaway HPA from infinite pod scheduling
+    pods: "60"               # prevents runaway HPA from infinite pod scheduling
 ---
 apiVersion: v1
 kind: Namespace
@@ -73,8 +95,8 @@ metadata:
   namespace: observability
 spec:
   hard:
-    requests.cpu: "3"
-    limits.cpu: "12"        # Prometheus + Alloy peak during compaction: 4-5 CPU
-    requests.memory: "4Gi"
-    limits.memory: "12Gi"
+    requests.cpu: "6"         # raised from 3 — Prometheus+Alloy at 1000VU = ~1.9 CPU
+    limits.cpu: "12"          # unchanged — Prometheus + Alloy peak during compaction
+    requests.memory: "8Gi"    # raised from 4Gi — fits all components + rolling restarts
+    limits.memory: "20Gi"     # raised from 12Gi — Tempo 3Gi + Prometheus 4Gi + headroom
     pods: "20"

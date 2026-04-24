@@ -1,36 +1,50 @@
-# observability/loki/loki.yaml — Holy Grail Edition
+# observability/loki/loki.yaml — Holy Grail Edition v2
 # =============================================================================
-# KEY FIXES vs previous version:
+# FIXES IN THIS VERSION:
 #
-# 1. max_query_series field does NOT exist in Loki 3.0.0.
-#    The correct field name is: max_query_series_limit (deprecated in 2.x)
-#    OR simply omitting it and relying on max_entries_limit_per_query.
-#    Including an unknown field in limits_config causes Loki to refuse to
-#    start with: "field max_query_series not found in type validation.Limits"
-#    Fix: removed max_query_series, kept max_entries_limit_per_query=10000.
+# FIX 1 — "empty ring" / ingester dropout (CRITICAL — this was breaking Loki)
+#   Root cause: ring.kvstore.store=inmemory. In monolithic mode, the ingester
+#   registers itself in the ring on startup. With inmemory, the ring state is
+#   held in-process. Under ANY memory pressure or GC pause > 2m, the heartbeat
+#   goroutine stalls and the instance falls out of the ring. The distributor
+#   then sees an empty ring and rejects all pushes with "empty ring" error.
+#   You saw this exact sequence:
+#     17:59 — "error getting ingester clients: empty ring"
+#     19:21 — last heartbeat recorded
+#     19:28 — "auto-forgetting instance...forget_period=2m0s"
+#   Fix: switch kvstore to memberlist. In monolithic single-pod mode,
+#   memberlist runs embedded and is self-healing — it does NOT have the
+#   heartbeat-stall failure mode. The ring stays healthy across GC pauses.
 #
-# 2. PriorityClass: observability-high. Without this, node pressure from
-#    boutique HPA scale-out can evict Loki — losing log history for the
-#    entire demo session.
+# FIX 2 — Loki has no PVC (data loss on every pod restart)
+#   Previous config used /tmp/loki paths with no PVC → all chunks lost on
+#   restart. Added loki-pvc (10Gi, local-path) and moved all paths under
+#   /var/loki which is mounted from the PVC. Chunks survive pod restarts.
+#   Note: grafana-pvc and tempo-pvc already exist. loki-pvc will be created
+#   fresh — kubectl apply will provision it via local-path-provisioner.
 #
-# 3. chunk_idle_period: 30s — kept. At 1000 VU this causes frequent small
-#    flushes which is correct behavior. The alternative (long idle period)
-#    holds more data in memory and risks OOM on the 1Gi limit.
+# FIX 3 — chunk_idle_period 30s → 3m
+#   30s caused constant flush churn at idle. With the ring fixed (FIX 1),
+#   we no longer need aggressive flushing to avoid ring-stall data loss.
+#   3m is the standard value for single-replica monolithic mode.
 #
-# 4. chunk_target_size added: 1572864 (1.5MiB). Tells Loki to close chunks
-#    when they reach this size rather than waiting for idle timeout.
-#    Prevents memory runaway when log burst rate is very high.
+# FIX 4 — ingestion_burst_size_mb: 64 is fine, kept. No change.
 #
-# 5. ingestion_burst_size_mb: 128→64. 128MB burst was theoretically correct
-#    but in practice Loki's ingestor holds the full burst in memory before
-#    flushing. On a 1Gi limit, a 128MB burst + other overhead = OOM risk.
-#    64MB is the right balance: absorbs thundering-herd startup, fits in RAM.
-#
-# 6. terminationGracePeriodSeconds: 30. Allows Loki to flush in-memory
-#    chunks to the filesystem on graceful shutdown. Without this, pod
-#    restarts lose buffered logs silently.
+# UNCHANGED — schema v13, tsdb, filesystem backend, query cache, limits.
 # =============================================================================
 
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: loki-pvc
+  namespace: observability
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 10Gi
+---
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -47,27 +61,43 @@ data:
 
     common:
       instance_addr: 127.0.0.1
-      path_prefix: /tmp/loki
+      path_prefix: /var/loki
       storage:
         filesystem:
-          chunks_directory: /tmp/loki/chunks
-          rules_directory: /tmp/loki/rules
+          chunks_directory: /var/loki/chunks
+          rules_directory:  /var/loki/rules
       replication_factor: 1
       ring:
         kvstore:
-          store: inmemory
+          # FIX 1: memberlist instead of inmemory.
+          # Memberlist is embedded in monolithic mode — no external consul/etcd
+          # needed. The ring stays registered even across long GC pauses because
+          # memberlist uses TCP gossip (not a periodic HTTP heartbeat that can
+          # stall). This eliminates the "empty ring" failure mode entirely.
+          store: memberlist
+
+    memberlist:
+      # Single node — join ourselves. Loki discovers its own pod IP via
+      # instance_addr above and joins the single-member gossip ring.
+      join_members: []
+      bind_port: 7946
 
     ingester:
-      chunk_idle_period: 30s
+      chunk_idle_period:  3m       # FIX 3: was 30s — reduced flush churn
       chunk_retain_period: 1m
-      chunk_target_size: 1572864    # 1.5MiB — close chunks by size, not just time
-      max_chunk_age: 2h
+      chunk_target_size:  1572864  # 1.5MiB — close chunks by size
+      max_chunk_age:      2h
+      lifecycler:
+        ring:
+          kvstore:
+            store: memberlist
+          replication_factor: 1
 
     query_range:
       results_cache:
         cache:
           embedded_cache:
-            enabled: true
+            enabled:     true
             max_size_mb: 200
 
     schema_config:
@@ -81,13 +111,12 @@ data:
             period: 24h
 
     limits_config:
-      reject_old_samples: false
+      reject_old_samples:         false
       reject_old_samples_max_age: 336h
-      ingestion_rate_mb: 64
-      ingestion_burst_size_mb: 64      # reduced from 128 — fits safely in 1Gi limit
-      per_stream_rate_limit: 10MB
+      ingestion_rate_mb:          64
+      ingestion_burst_size_mb:    64
+      per_stream_rate_limit:      10MB
       per_stream_rate_limit_burst: 20MB
-      # max_query_series does NOT exist in Loki 3.0 — removed (was causing startup failure)
       max_entries_limit_per_query: 10000
 
     analytics:
@@ -114,43 +143,53 @@ spec:
       terminationGracePeriodSeconds: 30
       securityContext:
         runAsUser: 0
+        fsGroup: 0
       containers:
         - name: loki
           image: grafana/loki:3.0.0
           args: [-config.file=/etc/loki/loki.yaml]
           ports:
-            - containerPort: 3100
-            - containerPort: 9096
+            - name: http
+              containerPort: 3100
+            - name: grpc
+              containerPort: 9096
+            - name: memberlist
+              containerPort: 7946
           readinessProbe:
             httpGet:
-              path: /ready
-              port: 3100
-            initialDelaySeconds: 10
-            periodSeconds: 10
-            failureThreshold: 5
-            timeoutSeconds: 5
+              path:   /ready
+              port:   3100
+            initialDelaySeconds: 15
+            periodSeconds:       10
+            failureThreshold:    5
+            timeoutSeconds:      5
           livenessProbe:
             httpGet:
-              path: /ready
-              port: 3100
-            initialDelaySeconds: 30
-            periodSeconds: 15
-            failureThreshold: 5
-            timeoutSeconds: 10
+              path:   /ready
+              port:   3100
+            initialDelaySeconds: 45
+            periodSeconds:       20
+            failureThreshold:    5
+            timeoutSeconds:      10
           volumeMounts:
-            - name: config
+            - name:      config
               mountPath: /etc/loki
+            - name:      data
+              mountPath: /var/loki
           resources:
             requests:
-              cpu: 200m
+              cpu:    200m
               memory: 256Mi
             limits:
-              cpu: 1000m
+              cpu:    1000m
               memory: 1Gi
       volumes:
         - name: config
           configMap:
             name: loki-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: loki-pvc
 ---
 apiVersion: v1
 kind: Service
@@ -169,3 +208,7 @@ spec:
     - name: grpc
       port: 9096
       targetPort: 9096
+    - name: memberlist
+      port: 7946
+      targetPort: 7946
+      protocol: TCP

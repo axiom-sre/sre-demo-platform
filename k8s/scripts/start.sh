@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# start.sh — SRE Demo Platform: Full Startup v5
+# start.sh — SRE Demo Platform: Full Startup v6
 # =============================================================================
 #
 # Usage:
@@ -22,29 +22,33 @@
 #  10. Port-forwards
 #  11. Warm gate + final status
 #
-# KEY CHANGES vs v4:
+# KEY CHANGES vs v5:
+#
+# [v6] Port-forward definitions fixed for Docker Desktop macOS.
+#      Frontend (boutique) and Grafana/Prometheus are LoadBalancer services —
+#      Docker Desktop maps them directly to localhost via the VM network.
+#      Port-forwarding these is unnecessary and caused "address already in use"
+#      conflicts. PF_DEFS now only port-forwards ClusterIP services:
+#        - alloy      :12345  (ClusterIP — UI + metrics endpoint)
+#        - tempo      :3200   (ClusterIP — trace search UI)
+#        - loki       :3100   (ClusterIP — log query API)
+#      These are always available without port-forward:
+#        - frontend   :8080   (LoadBalancer → localhost:8080 via Docker Desktop)
+#        - grafana    :3000   (LoadBalancer → 172.18.0.x:3000 via Docker Desktop)
+#        - prometheus :9090   (LoadBalancer → 172.18.0.x:9090 via Docker Desktop)
+#
+# [v6] doctor() PVC check updated — loki-pvc added (new in loki.yaml v2).
+#      Previous doctor() only checked grafana-pvc, prometheus-pvc, tempo-pvc.
+#
+# [v6] verify() Loki label check updated — job label is now
+#      "loki.source.kubernetes.pods" (loki.source.kubernetes component).
+#      Previous check used "pod" label which doesn't exist with API streaming.
 #
 # [v5] metrics-server source consolidated to cluster/metrics-server.yaml.
-#      infrastructure.yaml previously deployed metrics-server AND kube-state-metrics
-#      together, making it the dual source of truth that caused the immutable
-#      selector conflict on resume. Now:
-#        - cluster/metrics-server.yaml  → metrics-server only (kube-system)
-#        - infrastructure.yaml          → kube-state-metrics + node-exporter only
-#      resume() already applies cluster/metrics-server.yaml. Now start.sh matches.
-#
-# [v5] Local registry check added (was start_sh_patch.txt — now merged in).
-#      The patched frontend image (avoidNoopCurrencyConversionRPC=true) lives
-#      in a local Docker registry on :5001. Without this check, boutique deploy
-#      fails silently with ImagePullBackOff on the frontend pod.
-#      registry check runs BEFORE boutique apply, with clear rebuild instructions
-#      if the image is missing after a reboot.
-#
+# [v5] Local registry check added.
 # [v4] wait_warm_gate() — end-to-end HTTP verification before "STACK IS UP".
 # [v4] wait_tcp_ready() — TCP probe from inside cluster before frontend wait.
 # [v3] NodePort → LoadBalancer :8080 as primary URL.
-# [v3] find-url.sh for verified URL discovery.
-# [v2] minReadySeconds=30 accounted for in frontend wait timeout.
-# [v2] redis → cart → productcatalog → frontend startup order.
 # =============================================================================
 
 set -euo pipefail
@@ -69,10 +73,10 @@ section() {
   echo -e "${GREEN}════════════════════════════════════════${NC}"
 }
 
+# [v6] Only ClusterIP services need port-forwarding.
+# LoadBalancer services (frontend, grafana, prometheus) are directly accessible
+# via Docker Desktop's VM network bridge — no port-forward needed or wanted.
 PF_DEFS=(
-  "boutique      frontend   8080  8080  http://localhost:8080/_healthz"
-  "observability grafana    3000  3000  http://localhost:3000/api/health"
-  "observability prometheus 9090  9090  http://localhost:9090/-/healthy"
   "observability alloy      12345 12345 http://localhost:12345/-/ready"
   "observability tempo      3200  3200  http://localhost:3200/ready"
   "observability loki       3100  3100  http://localhost:3100/ready"
@@ -125,9 +129,6 @@ start_port_forward() {
   info "Port-forward $svc:$local_port ready ✓"
 }
 
-# ── Backend TCP warm check ────────────────────────────────────────────────────
-# Probes a TCP port from inside the cluster (via redis pod exec).
-# Confirms gRPC servers are accepting connections, not just that readiness passed.
 wait_tcp_ready() {
   local host=$1 port=$2 label=${3:-$1:$2} timeout_sec=${4:-120}
   info "Verifying $label gRPC port is warm (up to ${timeout_sec}s)..."
@@ -150,10 +151,6 @@ wait_tcp_ready() {
   info "$label accepting connections ✓ (${elapsed}s)"
 }
 
-# ── End-to-end HTTP warm gate ─────────────────────────────────────────────────
-# Polls GET / until HTTP 200 with real product content.
-# Requires productcatalog + currency + recommendation all responding.
-# This is the honest "stack is ready" signal — not just "pods are scheduled".
 wait_warm_gate() {
   local url=$1 timeout_sec=${2:-180}
   info "Warm gate: polling $url/ until real product page returns (up to ${timeout_sec}s)..."
@@ -188,7 +185,7 @@ wait_warm_gate() {
 
 # ── --pf-only mode ────────────────────────────────────────────────────────────
 if [[ "$MODE" == "--pf-only" ]]; then
-  section "Port-forwards only"
+  section "Port-forwards only (ClusterIP services)"
   pkill -f "kubectl port-forward" 2>/dev/null || true
   [[ -f "$PF_PID_FILE" ]] && rm "$PF_PID_FILE"
   touch "$PF_PID_FILE"
@@ -198,8 +195,21 @@ if [[ "$MODE" == "--pf-only" ]]; then
   done
   echo ""
   info "Port-forwards started."
-  WORKING_URL=$(bash "$SCRIPT_DIR/find-url.sh" --export 2>/dev/null || echo "http://localhost:8080")
-  info "Frontend: $WORKING_URL  |  Grafana: http://localhost:3000"
+  echo ""
+  echo "  Alloy UI:   http://localhost:12345"
+  echo "  Tempo:      http://localhost:3200"
+  echo "  Loki:       http://localhost:3100"
+  echo ""
+  echo "  (LoadBalancer services — always available without port-forward)"
+  FRONTEND_IP=$(kubectl get svc frontend -n boutique \
+    -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
+  GRAFANA_IP=$(kubectl get svc grafana -n observability \
+    -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
+  PROM_IP=$(kubectl get svc prometheus -n observability \
+    -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
+  echo "  Frontend:   http://localhost:8080  (${FRONTEND_IP:-LoadBalancer})"
+  echo "  Grafana:    http://${GRAFANA_IP:-172.18.0.x}:3000  admin/admin"
+  echo "  Prometheus: http://${PROM_IP:-172.18.0.x}:9090"
   exit 0
 fi
 
@@ -223,7 +233,7 @@ info "Cluster: $(kubectl config current-context)"
 total_mem_gb=$(kubectl get node -o jsonpath='{.items[0].status.capacity.memory}' 2>/dev/null \
   | sed 's/Ki$//' | awk '{printf "%.0f", $1/1024/1024}' || echo "0")
 if [[ "$total_mem_gb" -lt 16 ]]; then
-  warn "Node has only ${total_mem_gb}GB RAM. Recommend 24GB+ for 1000 VU."
+  warn "Node only has ${total_mem_gb}GB RAM. Recommend 24GB+ for 1000 VU."
 else
   info "Node memory: ${total_mem_gb}GB ✓"
 fi
@@ -234,8 +244,6 @@ kubectl apply -f namespaces/namespaces.yaml
 info "PriorityClasses and namespaces ready ✓"
 
 section "2. metrics-server"
-# Single source of truth: cluster/metrics-server.yaml
-# If selector label conflicts (immutable field), delete+recreate deployment only.
 if ! kubectl apply -f cluster/metrics-server.yaml 2>/dev/null; then
   warn "metrics-server apply failed (immutable selector) — forcing recreate..."
   kubectl delete deployment metrics-server -n kube-system --ignore-not-found 2>/dev/null
@@ -245,8 +253,6 @@ wait_ready_kind deployment metrics-server kube-system 120 || \
   warn "metrics-server slow — HPA targets may show <unknown> initially"
 
 section "3. Observability infrastructure (kube-state-metrics + node-exporter)"
-# infrastructure.yaml deploys kube-state-metrics and node-exporter ONLY.
-# metrics-server is handled above from cluster/metrics-server.yaml.
 kubectl apply -f observability/infrastructure/infrastructure.yaml
 kubectl rollout status deployment/kube-state-metrics -n observability \
   --timeout=120s 2>/dev/null && info "kube-state-metrics ✓" || \
@@ -267,7 +273,7 @@ kubectl rollout status deployment/tempo -n observability --timeout=120s 2>/dev/n
 section "5. Alloy (trace + log collector)"
 kubectl apply -f observability/alloy/alloy.yaml
 
-info "Waiting for Alloy DaemonSet (up to 390s — cold start can take 2-3 min)..."
+info "Waiting for Alloy DaemonSet (up to 390s)..."
 alloy_ready=false
 for i in $(seq 1 78); do
   desired=$(kubectl get daemonset alloy -n observability \
@@ -291,9 +297,6 @@ wait_ready_kind deployment grafana observability 180 || \
 wait || true
 
 section "7. Local registry (patched frontend image)"
-# The frontend is built with avoidNoopCurrencyConversionRPC=true to eliminate
-# the 10× currency RPC fan-out. It lives in a local Docker registry on :5001.
-# Without this image, the frontend pod will ImagePullBackOff silently.
 if command -v docker &>/dev/null; then
   if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^local-registry$"; then
     info "Local registry already running ✓"
@@ -310,7 +313,7 @@ if command -v docker &>/dev/null; then
     warn "Patched frontend image NOT found in registry."
     warn "Frontend pod will fail with ImagePullBackOff until this is resolved."
     warn ""
-    warn "If image was lost after reboot, rebuild:"
+    warn "Rebuild:"
     warn "  cd /tmp/boutique-patch"
     warn "  docker buildx build --platform linux/arm64 \\"
     warn "    --build-arg TARGETARCH=arm64 --build-arg TARGETOS=linux \\"
@@ -327,17 +330,9 @@ fi
 section "8. Boutique application"
 kubectl apply -f boutique/boutique.yaml
 
-# Wait in dependency order — this order matters:
-#   Redis must be ready before cartservice can connect.
-#   Cart must be ready before frontend stops returning 500s on /cart.
-#   productcatalog must be ready before frontend stops returning 500s on homepage.
-#   minReadySeconds=30 on frontend means rollout status completes 30s after
-#   the readiness probe passes.
-
 info "Waiting for Redis..."
 wait_ready_kind deployment redis boutique 60 || warn "Redis slow to start"
 
-# Cart runs in background — don't block on .NET JIT (startupProbe handles it).
 info "Cartservice starting in background (.NET JIT — non-blocking)..."
 kubectl rollout status deployment/cartservice -n boutique --timeout=150s 2>/dev/null &
 CART_PID=$!
@@ -349,7 +344,6 @@ wait_ready_kind deployment productcatalogservice boutique 90 || \
 info "Waiting for frontend (includes minReadySeconds=30 gate — up to 150s)..."
 wait_ready_kind deployment frontend boutique 150 || warn "Frontend slow to start"
 
-# All other services in background — not in the critical path for homepage
 for svc in emailservice recommendationservice shippingservice \
            paymentservice currencyservice adservice checkoutservice; do
   kubectl rollout status "deployment/$svc" -n boutique --timeout=180s 2>/dev/null &
@@ -370,7 +364,10 @@ else
   warn "Run 'kubectl get hpa -n boutique' in 60s to verify HPA has CPU metrics"
 fi
 
-section "10. Port-forwards"
+section "10. Port-forwards (ClusterIP services only)"
+# [v6] Only port-forward ClusterIP services.
+# Frontend :8080, Grafana :3000, Prometheus :9090 are LoadBalancer — Docker
+# Desktop exposes them directly. Port-forwarding them causes bind conflicts.
 pkill -f "kubectl port-forward" 2>/dev/null || true
 [[ -f "$PF_PID_FILE" ]] && rm "$PF_PID_FILE"
 touch "$PF_PID_FILE"
@@ -397,23 +394,30 @@ kubectl get pods -n boutique 2>/dev/null
 echo ""
 kubectl get hpa -n boutique 2>/dev/null
 
+# Show actual LoadBalancer IPs for reference
+GRAFANA_IP=$(kubectl get svc grafana -n observability \
+  -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "172.18.0.x")
+PROM_IP=$(kubectl get svc prometheus -n observability \
+  -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "172.18.0.x")
+
 echo ""
 echo -e "${GREEN}═══════════════════════════════════════════════${NC}"
 echo -e "${GREEN} STACK IS UP AND WARM (gate took ${gate_elapsed}s)${NC}"
 echo -e "${GREEN}═══════════════════════════════════════════════${NC}"
 echo ""
-echo "  Boutique:   $WORKING_URL"
-echo "  Grafana:    http://localhost:3000    admin/admin"
+echo "  Boutique:    $WORKING_URL            (LoadBalancer)"
+echo "  Grafana:     http://${GRAFANA_IP}:3000    admin/admin  (LoadBalancer)"
+echo "  Prometheus:  http://${PROM_IP}:9090   (LoadBalancer)"
 echo ""
-echo "  Prometheus: http://localhost:9090"
-echo "  Alloy:      http://localhost:12345"
-echo "  Tempo:      http://localhost:3200"
-echo "  Loki:       http://localhost:3100"
+echo "  Alloy UI:    http://localhost:12345   (port-forward)"
+echo "  Tempo:       http://localhost:3200    (port-forward)"
+echo "  Loki:        http://localhost:3100    (port-forward)"
 echo ""
-echo "  Smoke test:   k6 run --env BASE_URL=$WORKING_URL scripts/load-test_10vusers.js"
-echo "  100 VU:       k6 run --env BASE_URL=$WORKING_URL scripts/load-test_100vusers.js"
-echo "  1000 VU:      k6 run --env BASE_URL=$WORKING_URL scripts/load-test_1000vusers.js"
-echo "  Verify:       bash scripts/verify-stability.sh --short"
-echo "  HPA watch:    bash scripts/manage.sh hpa-watch"
-echo "  Full debug:   bash scripts/manage.sh debug"
+echo "  Smoke test:  k6 run --env BASE_URL=$WORKING_URL scripts/load-test_10vusers.js"
+echo "  100 VU:      k6 run --env BASE_URL=$WORKING_URL scripts/load-test_100vusers.js"
+echo "  1000 VU:     k6 run --env BASE_URL=$WORKING_URL scripts/load-test_1000vusers.js"
+echo "  Verify:      bash scripts/verify-stability.sh --short"
+echo "  HPA watch:   bash scripts/manage.sh hpa-watch"
+echo "  Full debug:  bash scripts/manage.sh debug"
+echo "  Health:      bash scripts/manage.sh doctor"
 echo ""

@@ -1,34 +1,39 @@
-# observability/tempo/tempo.yaml — Holy Grail Edition
+# observability/tempo/tempo.yaml — Holy Grail Edition v2
 # =============================================================================
-# KEY CHANGES vs previous version:
+# FIXES IN THIS VERSION:
 #
-# 1. PriorityClass: observability-high. Tempo is the most memory-hungry
-#    component — at 1000 VU the ingester holds ~800Mi-1Gi of span data.
-#    Without priority, node pressure evicts Tempo first (largest memory pod),
-#    losing all trace history and breaking trace-to-log correlation in Grafana.
+# FIX 1 — OOMKill (exit 137) — memory limit 2Gi → 3Gi
+#   Measured: Tempo sits at 786Mi at idle with 1000VU history in the ingester.
+#   The OOMKill happened at 13:28 after a 29-minute run — consistent with the
+#   ingester WAL filling up during the 1000VU load test. The ingester holds ALL
+#   unflushed spans in memory until max_block_duration (10m) elapses. At 1000VU
+#   with ~363 req/s and ~8 spans/request = ~2900 spans/sec × 600s flush window
+#   = ~1.7M spans in memory at peak. Each span ~800 bytes = ~1.4Gi. Add the
+#   service-graphs edge cache (see FIX 2), compactor overhead, and Go runtime:
+#   2Gi was the hard floor, not the headroom. 3Gi gives genuine buffer.
+#   Memory request raised to 1Gi to get better scheduling QoS.
 #
-# 2. terminationGracePeriodSeconds: 60. Tempo's ingester WAL flush to blocks
-#    takes 15-30s for a full 1000 VU session. Without 60s grace, SIGTERM
-#    during compaction loses the current WAL block entirely. 30s was too tight.
+# FIX 2 — service-graphs dropping spans (maxItems=10000 → 100000)
+#   The service-graphs processor builds a graph of service→service edges by
+#   holding incomplete request pairs in memory until both client+server spans
+#   arrive. maxItems caps how many incomplete edges fit in the cache at once.
+#   At 1000VU with 11 boutique services each making multiple downstream calls,
+#   the fan-out generates ~15-25 concurrent incomplete edges per request.
+#   1000VU × 25 edges = 25000 concurrent edges minimum. maxItems=10000 meant
+#   60%+ of edges were evicted before the matching span arrived → dropped.
+#   The log showed this clearly: "dropped 4511 spans", "dropped 3889 spans"
+#   every single second during the load test.
+#   Fix: max_items=100000 (100K). Memory cost: ~100K edges × ~200 bytes = 20MB.
+#   Completely acceptable within the new 3Gi limit.
 #
-# 3. search is enabled by default in Tempo 2.4.1. The explicit search: block
-#    was removed — "field search not found in type app.Config" parse error.
+# FIX 3 — max_block_duration 10m → 5m
+#   Shorter flush interval means less data in the ingester WAL at any moment.
+#   At 1000VU, 5m flush window holds ~870K spans vs 1.7M at 10m.
+#   Halves peak ingester memory. Compaction runs more frequently but each
+#   compaction job is smaller → less lock contention → no 503 storms.
 #
-# 4. send_native_histograms removed from remote_write — invalid in 2.4.1.
-#
-# 5. max_block_bytes is NOT a valid field in ingester in 2.4.1.
-#    It belongs in compactor.compaction only. Removed from ingester section.
-#
-# 6. ingester.max_block_duration: 10m — flush blocks every 10min to keep
-#    compaction work small. Large blocks (default 30min) cause 503 storms
-#    when compaction runs because the compactor holds the block lock.
-#
-# 7. Storage: PVC (not emptyDir). emptyDir is ephemeral — pod restart loses
-#    all trace history. PVC survives across restarts.
-#
-# 8. Resources: memory limit 1.5Gi → 2Gi. At 1000 VU sustained for 10min,
-#    the ingester peak was measured at 1.4-1.6Gi. 1.5Gi was the OOM boundary.
-#    2Gi gives genuine headroom without being wasteful (64GB host).
+# UNCHANGED: storage backend (local PVC), OTLP ports, Prometheus remote_write,
+# overrides processors list, compactor retention config.
 # =============================================================================
 
 apiVersion: v1
@@ -54,7 +59,7 @@ data:
     ingester:
       trace_idle_period:     20s
       flush_all_on_shutdown: true
-      max_block_duration:    10m
+      max_block_duration:    5m    # FIX 3: was 10m — halves peak WAL memory
 
     compactor:
       compaction:
@@ -62,7 +67,7 @@ data:
         compacted_block_retention: 1h
         compaction_window:         1h
         max_compaction_objects:    1000000
-        max_block_bytes:           104857600    # 100MiB — caps compaction block size
+        max_block_bytes:           104857600   # 100MiB
         retention_concurrency:     10
 
     metrics_generator:
@@ -70,6 +75,18 @@ data:
         external_labels:
           source:  tempo
           cluster: sre-demo
+      processor:
+        service_graphs:
+          # FIX 2: was 10000 — at 1000VU this caused 60%+ span drops.
+          # 100K edges × ~200 bytes = ~20MB. Fine within 3Gi limit.
+          max_items: 100000
+          # Wait up to 10s for the matching span before evicting an edge.
+          # Default is 10s — explicit here for documentation.
+          wait: 10s
+        span_metrics:
+          # Histogram buckets matching Alloy's spanmetrics connector
+          # for consistent latency data across both pipelines.
+          histogram_buckets: [0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.4, 0.8, 1.5, 3.0, 5.0]
       storage:
         path: /var/tempo/generator/wal
         remote_write:
@@ -117,11 +134,10 @@ spec:
         app: tempo
     spec:
       priorityClassName: observability-high
-      # 60s grace: ingester WAL flush + current block compaction at shutdown
       terminationGracePeriodSeconds: 60
       securityContext:
         runAsUser: 0
-        fsGroup: 0
+        fsGroup:   0
       containers:
         - name: tempo
           image: grafana/tempo:2.4.1
@@ -135,32 +151,32 @@ spec:
               containerPort: 4318
           readinessProbe:
             httpGet:
-              path: /ready
-              port: 3200
+              path:   /ready
+              port:   3200
             initialDelaySeconds: 15
-            periodSeconds: 10
-            failureThreshold: 5
-            timeoutSeconds: 5
+            periodSeconds:       10
+            failureThreshold:    5
+            timeoutSeconds:      5
           livenessProbe:
             httpGet:
-              path: /ready
-              port: 3200
+              path:   /ready
+              port:   3200
             initialDelaySeconds: 30
-            periodSeconds: 20
-            failureThreshold: 5
-            timeoutSeconds: 10
+            periodSeconds:       20
+            failureThreshold:    5
+            timeoutSeconds:      10
           volumeMounts:
-            - name: config
+            - name:      config
               mountPath: /etc/tempo
-            - name: data
+            - name:      data
               mountPath: /var/tempo
           resources:
             requests:
-              cpu: 300m
-              memory: 768Mi
+              cpu:    300m
+              memory: 1Gi    # raised from 768Mi — better scheduling QoS
             limits:
-              cpu: 1500m
-              memory: 2Gi    # raised from 1.5Gi — ingester peak at 1000 VU is 1.4-1.6Gi
+              cpu:    1500m
+              memory: 3Gi    # FIX 1: raised from 2Gi — measured peak 1.4-1.6Gi + headroom
       volumes:
         - name: config
           configMap:

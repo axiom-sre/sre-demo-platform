@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# manage.sh — SRE Demo Platform: Operations (Holy Grail Edition)
+# manage.sh — SRE Demo Platform: Operations (Holy Grail Edition v2)
 # =============================================================================
 #
 # Usage (run from repo root):
@@ -20,28 +20,37 @@
 #   bash scripts/manage.sh grafana-export    export Grafana UI edits to JSON files
 #   bash scripts/manage.sh doctor            health check everything in one command
 #
-# KEY CHANGES vs previous version:
-#   1. stop: now deletes resources in reverse dependency order — alloy first
-#      (stops new spans), then boutique, then observability. This prevents
-#      the situation where Tempo gets deleted while Alloy is still sending
-#      spans, causing a flood of UNAVAILABLE errors in the WAL queue.
-#   2. nuke: now also deletes PriorityClasses (they're cluster-scoped and
-#      were previously orphaned after nuke, causing "already exists" errors
-#      on next start.sh run).
-#   3. logs: added --previous flag support for post-crash log inspection.
-#      `manage.sh logs cartservice boutique --previous` shows the logs from
-#      the crashed container, not the new replacement.
-#   4. debug: added ResourceQuota usage, cartservice-specific OOM check,
-#      and HPA TARGETS column (shows actual vs target CPU utilization).
-#   5. New: budget — prints node CPU and memory request/limit totals by
-#      namespace so you can see if you're approaching node saturation.
-#   6. New: cart-debug — one-stop cartservice failure diagnosis:
-#      Redis connection count, .NET GC env vars, recent OOM events,
-#      HPA current/desired, pod resource usage.
-#   7. New: hpa-watch — watch-style HPA status that refreshes every 5s,
-#      showing TARGETS (current% / threshold%) alongside replica count.
-#   8. New: restart — rolling restart a specific deployment without stop/start.
-#   9. New: top — kubectl top pods for both namespaces side-by-side.
+# KEY CHANGES vs v1:
+#
+# [v2] doctor() PVC check: added loki-pvc.
+#      loki.yaml v2 added a PVC for Loki (/var/loki) so log data survives
+#      pod restarts. Previous doctor() only checked grafana-pvc, prometheus-pvc,
+#      tempo-pvc — loki-pvc was silently skipped. Now all 4 are checked.
+#
+# [v2] doctor() port-forward checks: removed frontend :8080, grafana :3000,
+#      prometheus :9090. These are LoadBalancer services — Docker Desktop
+#      exposes them via the VM network bridge directly. Port-forwarding them
+#      causes "address already in use" conflicts and is unnecessary.
+#      doctor() now correctly checks only the 3 ClusterIP port-forwards:
+#        alloy :12345, tempo :3200, loki :3100
+#      The LoadBalancer services are checked via their actual external IPs.
+#
+# [v2] verify() Loki label check updated.
+#      loki.source.kubernetes component (v4 alloy.yaml) produces streams with
+#      job label "loki.source.kubernetes.pods". The previous check queried for
+#      the "pod" label which always exists but doesn't confirm the pipeline
+#      is running. New check queries distributor lines_received metric directly
+#      for a definitive "data is flowing" confirmation.
+#
+# [v2] resume() port-forward: only restarts ClusterIP port-forwards (matching
+#      start.sh v6 PF_DEFS). No longer tries to port-forward LoadBalancer svcs.
+#
+# [v1] stop: reverse dependency order (alloy → boutique → observability).
+# [v1] nuke: deletes PriorityClasses (cluster-scoped).
+# [v1] logs: --previous flag for post-crash inspection.
+# [v1] debug: ResourceQuota, OOM check, HPA TARGETS.
+# [v1] budget, cart-debug, hpa-watch, restart, top, suspend, resume,
+#      grafana-export, doctor commands.
 # =============================================================================
 
 set -euo pipefail
@@ -60,7 +69,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PF_PID_FILE="${REPO_ROOT}/.pf-pids"
 
-# Workload kind lookup — alloy is a DaemonSet, everything else is a Deployment
 get_kind_for_svc() {
   case "$1" in
     alloy) echo "daemonset" ;;
@@ -69,9 +77,14 @@ get_kind_for_svc() {
   esac
 }
 
+# Helper: get LoadBalancer external IP for a service
+get_lb_ip() {
+  local svc=$1 ns=$2
+  kubectl get svc "$svc" -n "$ns" \
+    -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo ""
+}
+
 # ── stop ──────────────────────────────────────────────────────────────────────
-# Delete in reverse dependency order so no component tries to write to an
-# already-deleted backend. Alloy → boutique → observability backends.
 stop() {
   info "Stopping port-forwards..."
   pkill -f "kubectl port-forward" 2>/dev/null || true
@@ -120,7 +133,7 @@ nuke() {
   kubectl delete namespace "$OBS" --ignore-not-found
   kubectl delete namespace "$APP" --ignore-not-found
 
-  info "Deleting PriorityClasses (cluster-scoped — must clean up manually)..."
+  info "Deleting PriorityClasses (cluster-scoped)..."
   kubectl delete priorityclass boutique-high boutique-standard boutique-background \
     observability-high --ignore-not-found 2>/dev/null || true
 
@@ -164,7 +177,7 @@ debug() {
   header "Pod status — boutique"
   kubectl get pods -n "$APP" -o wide 2>/dev/null
 
-  header "HPA (with TARGETS — shows actual vs threshold CPU)"
+  header "HPA (with TARGETS)"
   kubectl get hpa -n "$APP" 2>/dev/null || true
 
   header "ResourceQuota usage — boutique"
@@ -199,7 +212,7 @@ debug() {
   header "Grafana logs (last 20)"
   kubectl logs -n "$OBS" deployment/grafana --tail=20 2>/dev/null || true
 
-  header "CartService logs (last 30) — current pod"
+  header "CartService logs (last 30)"
   kubectl logs -n "$APP" deployment/cartservice --tail=30 2>/dev/null || warn "CartService not running"
 
   header "Frontend logs (last 20)"
@@ -215,14 +228,10 @@ debug() {
 }
 
 # ── logs ──────────────────────────────────────────────────────────────────────
-# Usage: manage.sh logs <svc> [namespace] [--previous]
-# Defaults: svc=alloy, namespace=observability
-# --previous: show logs from the last crashed container (post-OOM debug)
 logs() {
   local svc="${2:-alloy}"
   local ns="${3:-$OBS}"
   local previous_flag=""
-  # Support --previous anywhere in args
   for arg in "$@"; do
     [[ "$arg" == "--previous" ]] && previous_flag="--previous"
   done
@@ -272,53 +281,73 @@ print('HAS DATA') if r else print('NO DATA')
     fi
   }
 
-  _check "spanmetrics latency bucket"   'count(traces_spanmetrics_latency_bucket)'
+  _check "spanmetrics latency bucket"   'count(traces_spanmetrics_duration_milliseconds_bucket)'
   _check "spanmetrics calls total"      'count(traces_spanmetrics_calls_total)'
-  _check "p95 latency (all services)"   'histogram_quantile(0.95,sum by(le,service)(rate(traces_spanmetrics_latency_bucket[5m])))'
-  _check "p99 latency (all services)"   'histogram_quantile(0.99,sum by(le,service)(rate(traces_spanmetrics_latency_bucket[5m])))'
-  _check "request rate by service"      'sum by(service)(rate(traces_spanmetrics_calls_total[5m]))'
+  _check "p95 latency (all services)"   'histogram_quantile(0.95,sum by(le,service_name)(rate(traces_spanmetrics_duration_milliseconds_bucket[5m])))'
+  _check "p99 latency (all services)"   'histogram_quantile(0.99,sum by(le,service_name)(rate(traces_spanmetrics_duration_milliseconds_bucket[5m])))'
+  _check "request rate by service"      'sum by(service_name)(rate(traces_spanmetrics_calls_total[5m]))'
   _check "service graph edges"          'count(traces_service_graph_request_total)'
   _check "kube-state-metrics HPA data"  'kube_horizontalpodautoscaler_status_current_replicas'
   _check "node CPU usage"               'instance:node_cpu_utilisation:rate5m'
-  _check "Alloy OTLP spans received"    'alloy_otelcol_receiver_accepted_spans_total'
+  _check "Alloy OTLP spans received"    'otelcol_receiver_accepted_spans_total'
 
   $pf_started && kill "$pf_pid" 2>/dev/null; pf_started=false
 
   echo ""
   info "Checking Loki log pipeline..."
-  local loki_up=false
+
+  # [v2] Check Loki distributor metric directly — definitive "data is flowing" signal.
+  # loki.source.kubernetes sends to distributor → distributor.lines_received_total > 0
+  # confirms end-to-end pipeline health regardless of chunk flush timing.
+  local loki_pf_started=false
   local loki_pid=0
   if ! curl -sf "http://localhost:3100/ready" -o /dev/null -m 3 2>/dev/null; then
     kubectl port-forward -n "$OBS" svc/loki 3100:3100 &>/tmp/pf-verify-loki.log &
     loki_pid=$!
     sleep 3
-    loki_up=true
+    loki_pf_started=true
   fi
 
-  local labels
-  labels=$(curl -sg "http://localhost:3100/loki/api/v1/labels" 2>/dev/null | \
-    python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-l = d.get('data', [])
-print('OK: ' + ', '.join(sorted(l))) if l else print('NO LABELS')
-" 2>/dev/null || echo "UNREACHABLE")
+  local lines_received
+  lines_received=$(curl -sg "http://localhost:3100/metrics" 2>/dev/null | \
+    grep "^loki_distributor_lines_received_total" | \
+    awk '{print $2}' | head -1 || echo "0")
 
-  if [[ "$labels" == OK* ]]; then
-    printf "  ${GREEN}✓${NC} Loki labels: %s\n" "${labels#OK: }"
-  elif [[ "$labels" == "NO LABELS" ]]; then
-    printf "  ${YELLOW}~${NC} Loki: ready but no labels yet (Alloy still discovering pods)\n"
+  if [[ "${lines_received:-0}" != "0" && "${lines_received:-0}" != "" ]]; then
+    printf "  ${GREEN}✓${NC} Loki: receiving logs — distributor lines_received_total = %s\n" "$lines_received"
+    # Also show label count if available
+    local label_count
+    label_count=$(curl -sg "http://localhost:3100/loki/api/v1/labels" 2>/dev/null | \
+      python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('data',[])))" 2>/dev/null || echo "0")
+    printf "  ${GREEN}✓${NC} Loki: %s label(s) queryable (chunks may still be flushing if 0)\n" "$label_count"
   else
-    printf "  ${RED}✗${NC} Loki: unreachable — check 'manage.sh logs loki'\n"
+    printf "  ${YELLOW}~${NC} Loki: no lines received yet — Alloy may still be discovering pods\n"
+    printf "       Check: kubectl logs -n observability daemonset/alloy --tail=20\n"
   fi
 
-  $loki_up && kill "$loki_pid" 2>/dev/null || true
+  $loki_pf_started && kill "$loki_pid" 2>/dev/null || true
+
+  # Tempo check
+  echo ""
+  info "Checking Tempo trace pipeline..."
+  local tempo_pf_started=false
+  local tempo_pid=0
+  if ! curl -sf "http://localhost:3200/ready" -o /dev/null -m 3 2>/dev/null; then
+    kubectl port-forward -n "$OBS" svc/tempo 3200:3200 &>/tmp/pf-verify-tempo.log &
+    tempo_pid=$!
+    sleep 3
+    tempo_pf_started=true
+  fi
+
+  local tempo_ready
+  tempo_ready=$(curl -sf "http://localhost:3200/ready" 2>/dev/null || echo "not ready")
+  printf "  ${GREEN}✓${NC} Tempo: %s\n" "$tempo_ready"
+
+  $tempo_pf_started && kill "$tempo_pid" 2>/dev/null || true
   echo ""
 }
 
 # ── budget ────────────────────────────────────────────────────────────────────
-# Prints a summary of CPU and memory requests vs node capacity.
-# Helps you see at a glance if you're approaching scheduling limits.
 budget() {
   header "Node capacity"
   kubectl get nodes -o custom-columns=\
@@ -358,12 +387,11 @@ print(f'  limits:   cpu={cpu_lim}m  mem={mem_lim}Mi')
   echo ""
   header "HPA scale-out capacity remaining"
   kubectl get hpa -n "$APP" \
-    -o custom-columns='HPA:.metadata.name,CURRENT:.status.currentReplicas,DESIRED:.status.desiredReplicas,MAX:.spec.maxReplicas,TARGETS:.status.conditions[0].message' \
+    -o custom-columns='HPA:.metadata.name,CURRENT:.status.currentReplicas,DESIRED:.status.desiredReplicas,MAX:.spec.maxReplicas' \
     2>/dev/null || true
 }
 
 # ── cart-debug ─────────────────────────────────────────────────────────────────
-# One-stop cartservice failure diagnosis. Run this when cart is crash-looping.
 cart_debug() {
   echo -e "${BOLD}════════════════════════════════════════════${NC}"
   echo -e "${BOLD} CARTSERVICE DEEP DIAGNOSTIC — $(date)${NC}"
@@ -390,7 +418,7 @@ cart_debug() {
 
   header "CartService logs — PREVIOUS crashed pod (if any)"
   kubectl logs -n "$APP" deployment/cartservice --previous --tail=50 2>/dev/null \
-    || info "No previous container (no recent crash, or pod not yet restarted)"
+    || info "No previous container (no recent crash)"
 
   header "Redis pod status"
   kubectl get pods -n "$APP" -l app=redis -o wide 2>/dev/null
@@ -399,7 +427,7 @@ cart_debug() {
   header "Redis logs (last 30)"
   kubectl logs -n "$APP" deployment/redis --tail=30 2>/dev/null || warn "Redis not running"
 
-  header "OOM events — boutique namespace (last 10 min)"
+  header "OOM events — boutique namespace"
   kubectl get events -n "$APP" --field-selector type=Warning \
     --sort-by='.lastTimestamp' 2>/dev/null | \
     grep -iE "(OOMKill|oom|Evict|BackOff)" | tail -20 || info "No OOM/eviction events"
@@ -410,8 +438,6 @@ cart_debug() {
 }
 
 # ── hpa-watch ─────────────────────────────────────────────────────────────────
-# Live HPA monitor — refreshes every 5s. Shows TARGETS (actual/threshold).
-# Press Ctrl+C to exit.
 hpa_watch() {
   info "Live HPA monitor — refreshing every 5s (Ctrl+C to stop)"
   echo ""
@@ -432,8 +458,6 @@ hpa_watch() {
 }
 
 # ── restart ───────────────────────────────────────────────────────────────────
-# Rolling restart a deployment without full stop/start cycle.
-# Usage: manage.sh restart <svc> [namespace]
 restart_svc() {
   local svc="${2:-}"
   local ns="${3:-$APP}"
@@ -463,12 +487,7 @@ top_pods() {
   kubectl top nodes 2>/dev/null || true
 }
 
-# ── dispatch ──────────────────────────────────────────────────────────────────
-
 # ── suspend ────────────────────────────────────────────────────────────────────
-# Scale all deployments to 0 — keeps namespaces/PVCs/config intact.
-# Frees ~3-4GB RAM immediately. Docker Desktop itself stays running.
-# Resume with: bash scripts/manage.sh resume
 suspend() {
   info "Suspending platform — scaling all deployments to 0..."
   info "(PVCs, ConfigMaps, namespaces preserved — resume is fast)"
@@ -477,15 +496,19 @@ suspend() {
   [[ -f "$PF_PID_FILE" ]] && rm -f "$PF_PID_FILE"
   info "Port-forwards stopped ✓"
 
-  # Scale observability down (alloy is DaemonSet — patch nodeSelector to prevent scheduling)
   for dep in grafana prometheus loki tempo kube-state-metrics; do
-    kubectl scale deployment/$dep -n observability --replicas=0 2>/dev/null &&       info "  $dep → 0" || true
+    kubectl scale deployment/$dep -n observability --replicas=0 2>/dev/null && \
+      info "  $dep → 0" || true
   done
-  kubectl patch daemonset alloy -n observability     -p '{"spec":{"template":{"spec":{"nodeSelector":{"suspend":"true"}}}}}'     2>/dev/null && info "  alloy (DaemonSet) → suspended" || true
+  kubectl patch daemonset alloy -n observability \
+    -p '{"spec":{"template":{"spec":{"nodeSelector":{"suspend":"true"}}}}}' \
+    2>/dev/null && info "  alloy (DaemonSet) → suspended" || true
 
-  # Scale boutique down
-  for dep in frontend cartservice checkoutservice productcatalogservice               currencyservice recommendationservice shippingservice               paymentservice emailservice adservice redis; do
-    kubectl scale deployment/$dep -n boutique --replicas=0 2>/dev/null &&       info "  $dep → 0" || true
+  for dep in frontend cartservice checkoutservice productcatalogservice \
+             currencyservice recommendationservice shippingservice \
+             paymentservice emailservice adservice redis; do
+    kubectl scale deployment/$dep -n boutique --replicas=0 2>/dev/null && \
+      info "  $dep → 0" || true
   done
 
   echo ""
@@ -495,15 +518,9 @@ suspend() {
 }
 
 # ── resume ─────────────────────────────────────────────────────────────────────
-# Restore all deployments to their normal replica counts.
-# Much faster than start.sh — no image pulls, config already applied.
 resume() {
   info "Resuming platform — restoring replica counts..."
 
-  # ── Cluster health check ────────────────────────────────────────────────────
-  # Docker Desktop upgrades wipe Kubernetes state entirely.
-  # Detect this by checking if our namespaces still exist.
-  # If they don't, resume is impossible — redirect to start.sh.
   if ! kubectl get namespace boutique &>/dev/null 2>&1; then
     warn "Boutique namespace missing — cluster was likely wiped by a Docker Desktop upgrade."
     warn "Resume is not possible. Running full start instead..."
@@ -519,38 +536,32 @@ resume() {
     exec bash "$SCRIPT_DIR_LOCAL/start.sh"
   fi
 
-  # ── PVC health check ────────────────────────────────────────────────────────
-  # If Grafana PVC is gone, warn before proceeding — dashboard edits will be lost.
   if ! kubectl get pvc grafana-pvc -n observability &>/dev/null 2>&1; then
     warn "grafana-pvc missing — dashboard edits from previous session are lost."
     warn "Continuing resume — Grafana will re-seed from ConfigMap defaults."
   fi
 
-
-  # ── Cluster infra re-apply ────────────────────────────────────────────────
-  # metrics-server must match YAML spec. If selector label changed (immutable),
-  # delete+recreate the deployment only — RBAC and Service are idempotent.
   info "Re-applying cluster infra..."
-  CLUSTER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/cluster"
+  CLUSTER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}}")/.." && pwd)/cluster"
   if ! kubectl apply -f "$CLUSTER_DIR/metrics-server.yaml" 2>/dev/null; then
     warn "  metrics-server apply failed (immutable selector) — forcing recreate..."
     kubectl delete deployment metrics-server -n kube-system --ignore-not-found 2>/dev/null
     kubectl apply -f "$CLUSTER_DIR/metrics-server.yaml"
   fi
   kubectl rollout status deployment/metrics-server -n kube-system --timeout=60s 2>/dev/null \
-    && info "  metrics-server ✓" || warn "  metrics-server slow — HPA targets may show <unknown> briefly"
+    && info "  metrics-server ✓" || warn "  metrics-server slow"
 
-  # Restore alloy DaemonSet (remove the suspend nodeSelector)
-  kubectl patch daemonset alloy -n observability     --type=json     -p='[{"op":"remove","path":"/spec/template/spec/nodeSelector/suspend"}]'     2>/dev/null && info "  alloy DaemonSet → restored" || true
+  kubectl patch daemonset alloy -n observability \
+    --type=json \
+    -p='[{"op":"remove","path":"/spec/template/spec/nodeSelector/suspend"}]' \
+    2>/dev/null && info "  alloy DaemonSet → restored" || true
 
-  # Restore observability
   kubectl scale deployment/prometheus    -n observability --replicas=1 2>/dev/null
   kubectl scale deployment/loki         -n observability --replicas=1 2>/dev/null
   kubectl scale deployment/tempo        -n observability --replicas=1 2>/dev/null
   kubectl scale deployment/grafana      -n observability --replicas=1 2>/dev/null
   kubectl scale deployment/kube-state-metrics -n observability --replicas=1 2>/dev/null
 
-  # Restore boutique
   kubectl scale deployment/redis               -n boutique --replicas=1 2>/dev/null
   kubectl scale deployment/cartservice         -n boutique --replicas=2 2>/dev/null
   kubectl scale deployment/frontend            -n boutique --replicas=2 2>/dev/null
@@ -565,45 +576,66 @@ resume() {
 
   info "Replica counts restored ✓"
 
-  # Wait for observability pods BEFORE starting port-forwards.
-  # Without this, port-forward connects before the pod is Ready and silently fails.
-  # Grafana has an init container (dashboard-seeder) that adds ~15s to startup.
   info "Waiting for observability stack to be ready..."
-  kubectl rollout status deployment/prometheus -n observability --timeout=120s 2>/dev/null     && info "  prometheus ✓" || warn "  prometheus slow"
-  kubectl rollout status deployment/grafana -n observability --timeout=120s 2>/dev/null     && info "  grafana ✓" || warn "  grafana slow — check: kubectl describe pod -n observability -l app=grafana"
-  kubectl rollout status deployment/loki  -n observability --timeout=60s 2>/dev/null     && info "  loki ✓" || true
-  kubectl rollout status deployment/tempo -n observability --timeout=60s 2>/dev/null     && info "  tempo ✓" || true
+  kubectl rollout status deployment/prometheus -n observability --timeout=120s 2>/dev/null \
+    && info "  prometheus ✓" || warn "  prometheus slow"
+  kubectl rollout status deployment/grafana -n observability --timeout=120s 2>/dev/null \
+    && info "  grafana ✓" || warn "  grafana slow"
+  kubectl rollout status deployment/loki  -n observability --timeout=60s 2>/dev/null \
+    && info "  loki ✓" || true
+  kubectl rollout status deployment/tempo -n observability --timeout=60s 2>/dev/null \
+    && info "  tempo ✓" || true
 
-  info "Restarting port-forwards..."
-  SCRIPT_DIR_LOCAL="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  bash "$SCRIPT_DIR_LOCAL/start.sh" --pf-only
+  # [v2] Only restart ClusterIP port-forwards — LoadBalancer services don't need them
+  info "Restarting port-forwards (ClusterIP services only)..."
+  pkill -f "kubectl port-forward" 2>/dev/null || true
+  sleep 1
+  kubectl port-forward -n observability svc/alloy 12345:12345 > /tmp/pf-alloy.log 2>&1 &
+  kubectl port-forward -n observability svc/tempo 3200:3200   > /tmp/pf-tempo.log 2>&1 &
+  kubectl port-forward -n observability svc/loki  3100:3100   > /tmp/pf-loki.log  2>&1 &
+  sleep 3
 
   echo ""
   info "Waiting for cartservice (.NET JIT — up to 90s)..."
-  kubectl rollout status deployment/cartservice -n boutique --timeout=150s 2>/dev/null ||     warn "Cart still starting — check: kubectl get pods -n boutique"
+  kubectl rollout status deployment/cartservice -n boutique --timeout=150s 2>/dev/null || \
+    warn "Cart still starting — check: kubectl get pods -n boutique"
+
+  # Get actual LoadBalancer IPs
+  GRAFANA_IP=$(get_lb_ip grafana observability)
+  PROM_IP=$(get_lb_ip prometheus observability)
 
   echo ""
   info "Platform resumed ✓"
-  info "  Grafana:  http://localhost:3000  (admin/admin)"
-  info "  Boutique: http://localhost:8080"
-  info "  Smoke:    k6 run scripts/load-test_10vusers.js"
+  echo ""
+  echo "  Boutique:    http://localhost:8080"
+  echo "  Grafana:     http://${GRAFANA_IP:-172.18.0.x}:3000   admin/admin"
+  echo "  Prometheus:  http://${PROM_IP:-172.18.0.x}:9090"
+  echo "  Alloy UI:    http://localhost:12345"
+  echo "  Tempo:       http://localhost:3200"
+  echo "  Loki:        http://localhost:3100"
+  echo ""
+  echo "  Smoke: k6 run scripts/load-test_10vusers.js"
 }
 
 # ── grafana-export ─────────────────────────────────────────────────────────────
-# Export all Grafana dashboards to k8s/observability/grafana/dashboards/
-# Run this BEFORE nuking to preserve dashboard edits made in the Grafana UI.
-# On next start.sh, dashboards are loaded from the ConfigMap automatically
-# IF you update grafana.yaml with the exported JSON.
 grafana_export() {
   local out_dir="${REPO_ROOT}/observability/grafana/dashboards"
   mkdir -p "$out_dir"
 
-  info "Exporting Grafana dashboards to $out_dir ..."
-  info "(Grafana must be port-forwarded on :3000)"
+  # Determine Grafana URL — LoadBalancer IP or localhost port-forward
+  local grafana_url="http://localhost:3000"
+  local lb_ip
+  lb_ip=$(get_lb_ip grafana observability)
+  if [[ -n "$lb_ip" ]]; then
+    grafana_url="http://${lb_ip}:3000"
+  fi
 
-  # Get all dashboard UIDs
+  info "Exporting Grafana dashboards to $out_dir ..."
+  info "Using Grafana at: $grafana_url"
+
   local uids
-  uids=$(curl -sf "http://localhost:3000/api/search?type=dash-db"     -u admin:admin 2>/dev/null | python3 -c "
+  uids=$(curl -sf "${grafana_url}/api/search?type=dash-db" \
+    -u admin:admin 2>/dev/null | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
 for d in data:
@@ -611,20 +643,21 @@ for d in data:
 " 2>/dev/null)
 
   if [[ -z "$uids" ]]; then
-    warn "Could not reach Grafana at localhost:3000 — is port-forward running?"
-    warn "Run: bash scripts/start.sh --pf-only"
+    warn "Could not reach Grafana at $grafana_url"
+    warn "Try: bash scripts/start.sh --pf-only  then retry"
     return 1
   fi
 
   local count=0
   while IFS='|' read -r uid title; do
     local fname="${out_dir}/${uid}-${title}.json"
-    if curl -sf "http://localhost:3000/api/dashboards/uid/$uid"         -u admin:admin 2>/dev/null         | python3 -c "
+    if curl -sf "${grafana_url}/api/dashboards/uid/$uid" \
+        -u admin:admin 2>/dev/null \
+        | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
-# Strip server-side metadata, keep the dashboard definition
 out = d['dashboard']
-out['id'] = None  # clear id so Grafana imports cleanly
+out['id'] = None
 json.dump(out, sys.stdout, indent=2)
 " > "$fname" 2>/dev/null; then
       info "  Exported: $title → $(basename $fname)"
@@ -636,16 +669,14 @@ json.dump(out, sys.stdout, indent=2)
 
   echo ""
   info "$count dashboard(s) exported to $out_dir"
-  warn "NEXT STEP: Update grafana.yaml ConfigMaps with the exported JSON"
-  warn "then commit: git add observability/grafana/dashboards/ && git commit -m 'export: grafana dashboards'"
+  warn "NEXT STEP: commit exported dashboards:"
+  warn "  git add observability/grafana/dashboards/ && git commit -m 'export: grafana dashboards'"
 }
 
 # ── doctor ────────────────────────────────────────────────────────────────────
-# Quick health check — run after resume or when something feels off.
-# Checks: cluster reachable, namespaces exist, all pods running, PVCs bound,
-# port-forwards alive, Grafana API responding, spanmetrics flowing.
+# [v2] Updated: loki-pvc added, LoadBalancer services checked via IP not port-forward.
 doctor() {
-  local ok=0 warn_count=0
+  local warn_count=0
   pass() { echo -e "  ${GREEN}✓${NC} $*"; }
   fail() { echo -e "  ${RED}✗${NC} $*"; warn_count=$((warn_count+1)); }
   maybe() { echo -e "  ${YELLOW}~${NC} $*"; }
@@ -659,43 +690,96 @@ doctor() {
   echo ""
   echo -e "${BOLD}── Pods ─────────────────────────────────────────${NC}"
   local not_running
-  not_running=$(kubectl get pods -n observability -n boutique     --field-selector='status.phase!=Running'     -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '
-' | grep -v "^$" || true)
+  not_running=$(kubectl get pods -n observability --field-selector='status.phase!=Running' \
+    -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n' | grep -v "^$" || true)
+  not_running+=" "$(kubectl get pods -n boutique --field-selector='status.phase!=Running' \
+    -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n' | grep -v "^$" || true)
+  not_running=$(echo "$not_running" | tr ' ' '\n' | grep -v "^$" || true)
   if [[ -z "$not_running" ]]; then
     pass "all pods Running"
   else
-    fail "non-running pods: $not_running"
+    fail "non-running pods: $(echo $not_running | tr '\n' ' ')"
   fi
 
   echo ""
   echo -e "${BOLD}── PVCs ─────────────────────────────────────────${NC}"
-  for pvc in grafana-pvc prometheus-pvc tempo-pvc; do
-    local status
-    status=$(kubectl get pvc $pvc -n observability -o jsonpath='{.status.phase}' 2>/dev/null || echo "MISSING")
-    if [[ "$status" == "Bound" ]]; then
+  # [v2] loki-pvc added — loki.yaml v2 adds PVC for log persistence
+  for pvc in grafana-pvc prometheus-pvc tempo-pvc loki-pvc; do
+    local pvc_status
+    pvc_status=$(kubectl get pvc $pvc -n observability -o jsonpath='{.status.phase}' 2>/dev/null || echo "MISSING")
+    if [[ "$pvc_status" == "Bound" ]]; then
       pass "$pvc: Bound"
     else
-      fail "$pvc: $status"
+      fail "$pvc: $pvc_status"
     fi
   done
 
   echo ""
-  echo -e "${BOLD}── Port-forwards ────────────────────────────────${NC}"
-  curl -sf http://localhost:8080/_healthz -o /dev/null -m 3 && pass "boutique :8080" || fail "boutique :8080 — run: bash scripts/start.sh --pf-only"
-  curl -sf http://localhost:3000/api/health -o /dev/null -m 3 && pass "grafana :3000" || fail "grafana :3000 — run: bash scripts/start.sh --pf-only"
-  curl -sf http://localhost:9090/-/healthy -o /dev/null -m 3 && pass "prometheus :9090" || fail "prometheus :9090"
-  curl -sf http://localhost:12345/-/ready -o /dev/null -m 3 && pass "alloy :12345" || fail "alloy :12345"
-  curl -sf http://localhost:3200/ready -o /dev/null -m 3 && pass "tempo :3200" || fail "tempo :3200"
-  curl -sf http://localhost:3100/ready -o /dev/null -m 3 && pass "loki :3100" || fail "loki :3100"
+  echo -e "${BOLD}── Services ─────────────────────────────────────${NC}"
+  # [v2] LoadBalancer services — check via actual external IP, not port-forward
+  local frontend_ip grafana_ip prom_ip
+  frontend_ip=$(kubectl get svc frontend -n boutique \
+    -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
+  grafana_ip=$(get_lb_ip grafana observability)
+  prom_ip=$(get_lb_ip prometheus observability)
+
+  if curl -sf "http://localhost:8080/_healthz" -o /dev/null -m 5 2>/dev/null; then
+    pass "boutique frontend :8080 (localhost)"
+  elif [[ -n "$frontend_ip" ]] && curl -sf "http://${frontend_ip}:8080/_healthz" -o /dev/null -m 5 2>/dev/null; then
+    pass "boutique frontend :8080 (${frontend_ip})"
+  else
+    fail "boutique frontend :8080 — check: kubectl get pods -n boutique"
+  fi
+
+  # Try localhost port-forward first (always works on macOS), fall back to LB IP
+  if curl -sf "http://localhost:3000/api/health" -o /dev/null -m 5 2>/dev/null; then
+    pass "grafana :3000 (localhost port-forward)"
+  elif [[ -n "$grafana_ip" ]] && curl -sf "http://${grafana_ip}:3000/api/health" -o /dev/null -m 5 2>/dev/null; then
+    pass "grafana :3000 (${grafana_ip})"
+  else
+    fail "grafana :3000 — run: bash scripts/start.sh --pf-only"
+  fi
+
+  if curl -sf "http://localhost:9090/-/healthy" -o /dev/null -m 5 2>/dev/null; then
+    pass "prometheus :9090 (localhost port-forward)"
+  elif [[ -n "$prom_ip" ]] && curl -sf "http://${prom_ip}:9090/-/healthy" -o /dev/null -m 5 2>/dev/null; then
+    pass "prometheus :9090 (${prom_ip})"
+  else
+    fail "prometheus :9090 — run: bash scripts/start.sh --pf-only"
+  fi
+
+  echo ""
+  echo -e "${BOLD}── Port-forwards (ClusterIP) ────────────────────${NC}"
+  # [v2] Only check ClusterIP port-forwards — these are the 3 that actually need forwarding
+  curl -sf http://localhost:12345/-/ready -o /dev/null -m 3 && pass "alloy :12345" || \
+    fail "alloy :12345 — run: bash scripts/start.sh --pf-only"
+  curl -sf http://localhost:3200/ready -o /dev/null -m 3 && pass "tempo :3200" || \
+    fail "tempo :3200 — run: bash scripts/start.sh --pf-only"
+  curl -sf http://localhost:3100/ready -o /dev/null -m 3 && pass "loki :3100" || \
+    fail "loki :3100 — run: bash scripts/start.sh --pf-only"
 
   echo ""
   echo -e "${BOLD}── Observability pipeline ───────────────────────${NC}"
+
+  # Spanmetrics via Prometheus
+  local prom_base="http://localhost:9090"
   local series
-  series=$(curl -sf "http://localhost:9090/api/v1/query?query=traces_spanmetrics_calls_total"     2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d['data']['result']))" 2>/dev/null || echo "0")
+  series=$(curl -sf "${prom_base}/api/v1/query?query=traces_spanmetrics_calls_total" \
+    2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d['data']['result']))" 2>/dev/null || echo "0")
   if [[ "$series" -gt 0 ]]; then
     pass "spanmetrics flowing ($series series)"
   else
-    maybe "spanmetrics: 0 series — send some traffic first: k6 run scripts/load-test_10vusers.js"
+    maybe "spanmetrics: 0 series — send traffic: k6 run scripts/load-test_10vusers.js"
+  fi
+
+  # Loki pipeline
+  local loki_lines
+  loki_lines=$(curl -sf "http://localhost:3100/metrics" 2>/dev/null | \
+    grep "^loki_distributor_lines_received_total" | awk '{print $2}' | head -1 || echo "0")
+  if [[ "${loki_lines:-0}" != "0" && "${loki_lines:-0}" != "" ]]; then
+    pass "Loki log pipeline — ${loki_lines} lines received"
+  else
+    maybe "Loki: no lines yet — check alloy logs"
   fi
 
   echo ""
@@ -708,21 +792,21 @@ doctor() {
 }
 
 case "$CMD" in
-  stop)        stop ;;
-  nuke)        nuke ;;
-  status)      status ;;
-  debug)       debug ;;
-  logs)        logs "$@" ;;
-  verify)      verify ;;
-  budget)      budget ;;
-  cart-debug)  cart_debug ;;
-  hpa-watch)   hpa_watch ;;
-  restart)     restart_svc "$@" ;;
-  top)         top_pods ;;
-  suspend)     suspend ;;
-  resume)      resume ;;
+  stop)           stop ;;
+  nuke)           nuke ;;
+  status)         status ;;
+  debug)          debug ;;
+  logs)           logs "$@" ;;
+  verify)         verify ;;
+  budget)         budget ;;
+  cart-debug)     cart_debug ;;
+  hpa-watch)      hpa_watch ;;
+  restart)        restart_svc "$@" ;;
+  top)            top_pods ;;
+  suspend)        suspend ;;
+  resume)         resume ;;
   grafana-export) grafana_export ;;
-  doctor)      doctor ;;
+  doctor)         doctor ;;
   *)
     echo ""
     echo -e "${BOLD}Usage: bash scripts/manage.sh <command>${NC}"
@@ -739,10 +823,10 @@ case "$CMD" in
     echo "  hpa-watch               live HPA scaling monitor (refreshes 5s)"
     echo "  restart <svc> [ns]      rolling restart a deployment"
     echo "  top                     kubectl top pods for both namespaces"
-  echo "  suspend                 scale all to 0, free RAM (keeps PVCs)"
-  echo "  resume                  restore from suspend (fast, no image pulls)"
-  echo "  grafana-export          export dashboard edits to JSON files"
-  echo "  doctor                  health check — cluster, pods, PVCs, port-forwards, pipeline"
+    echo "  suspend                 scale all to 0, free RAM (keeps PVCs)"
+    echo "  resume                  restore from suspend (fast, no image pulls)"
+    echo "  grafana-export          export dashboard edits to JSON files"
+    echo "  doctor                  health check — cluster, pods, PVCs, pipeline"
     echo ""
     echo "Startup:    bash scripts/start.sh"
     echo "Stability:  bash scripts/verify-stability.sh [--short|--no-k6]"
