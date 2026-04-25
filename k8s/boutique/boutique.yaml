@@ -259,7 +259,7 @@ spec:
               memory: 64Mi
             limits:
               cpu: 200m
-              memory: 128Mi
+              memory: 256Mi
 ---
 apiVersion: v1
 kind: Service
@@ -425,7 +425,7 @@ spec:
           resources:
             requests:
               cpu: 50m        # observed: 1m idle. HPA fires at 30m (60% × 50m). was 15m → OOMKill fix
-              memory: 256Mi   # was 64Mi — observed 97Mi at 1000 VU; OOMKill risk fixed
+              memory: 128Mi   # was 64Mi — observed 97Mi at 1000 VU; OOMKill risk fixed
             limits:
               cpu: 300m
               memory: 256Mi   # was 256Mi — doubled to eliminate OOMKill at peak load
@@ -513,7 +513,7 @@ spec:
               memory: 64Mi
             limits:
               cpu: 500m
-              memory: 128Mi
+              memory: 256Mi
 ---
 apiVersion: v1
 kind: Service
@@ -643,7 +643,7 @@ metadata:
   labels:
     app: paymentservice
 spec:
-  replicas: 1
+  replicas: 2
   progressDeadlineSeconds: 180
   selector:
     matchLabels:
@@ -688,11 +688,11 @@ spec:
             timeoutSeconds: 5
           resources:
             requests:
-              cpu: 50m        # observed: 1m idle
-              memory: 64Mi
+              cpu: 100m        # observed: 1m idle
+              memory: 128Mi
             limits:
               cpu: 500m
-              memory: 128Mi
+              memory: 256Mi
 ---
 apiVersion: v1
 kind: Service

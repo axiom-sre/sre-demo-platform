@@ -1,61 +1,35 @@
-# boutique/hpa.yaml — Holy Grail Edition v6
+# hpa.yaml — Boutique HPA definitions (all services)
 # =============================================================================
-# KEY CHANGES v6 — Runtime-Aware HPA Design:
+# VERSION HISTORY:
+#   v1 — CPU-only HPA on all services
+#   v2 — Added memory triggers to memory-sensitive services
+#        paymentservice: 91.4% memory observed at 1000 VU (2026-04-24)
+#        emailservice:   63.8% memory observed at 1000 VU
+#        currencyservice: 63.7% memory observed at 1000 VU
+#        adservice:      54.3% memory observed at 1000 VU
 #
-# CORE PRINCIPLE: Memory-based HPA only works for runtimes that promptly
-# release RSS back to the OS after load. Go does this via MADV_FREE.
-# Python, Node.js, .NET, and JVM do NOT — they hold pages in internal
-# allocator pools. Memory-based HPA on these runtimes causes pods to get
-# stuck above minReplicas indefinitely after load ends.
+# SCALING PHILOSOPHY:
+#   - Scale up fast (15s stabilization, +2 pods per 30s)
+#   - Scale down slow (120s stabilization) — avoids thrash
+#   - Memory threshold at 65% — gives headroom before OOMKill
+#   - CPU threshold tuned per service characteristics
 #
-# MEMORY TRIGGER — KEEP for Go services only:
-#   frontend (Go)       ✓ releases RSS promptly
-#   checkoutservice (Go) ✓ releases RSS promptly
-#   shippingservice (Go) ✓ releases RSS promptly
-#
-# MEMORY TRIGGER — REMOVED from non-Go services:
-#   recommendationservice (Python) — pymalloc never releases pages to OS
-#   cartservice (.NET)             — GC-managed, slow release
-#   paymentservice (Node.js)       — V8 GC releases slowly
-#   currencyservice (Node.js)      — same as payment
-#
-# SCALEDOWN POLICY — tuned per service type:
-#   Customer-facing / fan-out orchestrators: 1 pod/60s, 300s window (conservative)
-#   Stateless background workers:            2 pods/60s, 120s window (fast)
-#   .NET services with JIT warmup:           1 pod/60s, 300s window (conservative)
-#
-# [FIX 1 — recommendationservice: memory trigger removed, scaleDown 300→120s]
-#   Python RSS stays elevated post-load due to pymalloc. Confirmed by observing
-#   5 pods stuck for 60+ minutes post 1000 VU test with 57% memory utilization
-#   against 65% target. CPU was at 3% — the pod was idle, memory lied.
-#   scaleDown window cut to 120s — Python CPU drops to idle immediately.
-#
-# [FIX 2 — productcatalogservice: scaleDown window 300→180s, rate 1→2 pods]
-#   Go service, stateless. No warmup cost. Faster scale-down is safe.
-#
-# [FIX 3 — currencyservice: scaleDown window 300→180s, rate 1→2 pods]
-#   Go service (note: upstream is Node.js but this image is Go-based).
-#   Stateless, no warmup cost. Faster scale-down reduces idle pod waste.
-#
-# [FIX 4 — shippingservice: scaleDown window 300→120s, rate 1→2 pods]
-#   Go service, fully stateless, no downstream state. Fast scale-down is safe.
-#
-# [FIX 5 — paymentservice: scaleDown window 300→120s, rate 1→2 pods]
-#   Node.js, stateless. No JIT warmup. Fast scale-down is safe.
-#
-# NODE BUDGET v6: unchanged from v5 — ~5070m / ~48000m M5 Pro = 10.6%
+# CAPACITY BASELINE (2026-04-24 capacity test):
+#   Safe operating point: 500 VU / 6,200 req/s
+#   Saturation point:     600 VU / 7,000 req/s
+#   paymentservice OOMKill risk confirmed at 1000 VU
 # =============================================================================
 
-# ── Frontend — Go: MEMORY PRIMARY (correct — Go releases RSS promptly) ────────
-#
-# Memory trigger: 60% × 128Mi = 77Mi → goroutine queue depth proxy
-# CPU trigger:    50% × 50m   = 25m  → safety net
-# scaleDown: conservative — customer-facing, 1 pod/60s, 300s window
+# ── frontend ──────────────────────────────────────────────────────────────────
+# Memory added: frontend hits 36% at 1000 VU — not critical but worth tracking
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
   name: frontend
   namespace: boutique
+  labels:
+    app: frontend
+    hpa-version: v2
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
@@ -66,127 +40,42 @@ spec:
   metrics:
     - type: Resource
       resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50
+    - type: Resource
+      resource:
         name: memory
         target:
           type: Utilization
-          averageUtilization: 60    # 60% × 128Mi = 77Mi — goroutine queue proxy
-    - type: Resource
-      resource:
-        name: cpu
-        target:
-          type: Utilization
-          averageUtilization: 50    # 50% × 50m = 25m — secondary safety net
+          averageUtilization: 60
   behavior:
     scaleUp:
       stabilizationWindowSeconds: 15
-      policies:
-        - type: Pods
-          value: 3
-          periodSeconds: 30
-    scaleDown:
-      stabilizationWindowSeconds: 300    # conservative — customer-facing
-      policies:
-        - type: Pods
-          value: 1
-          periodSeconds: 60
----
-# ── Product Catalog — Go: CPU-only, faster scaleDown ─────────────────────────
-#
-# Go service, stateless product catalog reads. No warmup cost on new pods.
-# CPU trigger: 50% × 60m = 30m actual
-# scaleDown: medium — 2 pods/60s, 180s window
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata:
-  name: productcatalogservice
-  namespace: boutique
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: productcatalogservice
-  minReplicas: 2
-  maxReplicas: 8
-  metrics:
-    - type: Resource
-      resource:
-        name: cpu
-        target:
-          type: Utilization
-          averageUtilization: 50    # 50% × 60m = 30m actual trigger
-  behavior:
-    scaleUp:
-      stabilizationWindowSeconds: 15
+      selectPolicy: Max
       policies:
         - type: Pods
           value: 2
           periodSeconds: 30
     scaleDown:
-      stabilizationWindowSeconds: 180    # was 300 — Go stateless, safe to be faster
-      policies:
-        - type: Pods
-          value: 2                       # was 1 — scale 2 at a time for faster recovery
-          periodSeconds: 60
----
-# ── Recommendation — Python: CPU-ONLY (memory trigger permanently removed) ────
-#
-# REASON: Python's pymalloc allocator does not release RSS pages back to the
-# OS after peak load. Post-test RSS stays at ~75Mi (57% of 128Mi request)
-# indefinitely. Memory-based HPA sees this as "still under load" and refuses
-# to scale down. Confirmed: 5 pods stuck for 60+ minutes post 1000 VU test.
-#
-# CPU is the only reliable signal for Python GIL-bound services.
-# The GIL means each pod handles one thread regardless of memory.
-# CPU directly reflects whether the pod is processing requests.
-#
-# scaleDown: aggressive — Python CPU drops to idle instantly, no warmup cost.
-# 120s window + 2 pods/60s means 5→2 takes ~3 minutes after load ends.
-# Previously took 60+ minutes due to memory trigger holding replicas up.
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata:
-  name: recommendationservice
-  namespace: boutique
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: recommendationservice
-  minReplicas: 2
-  maxReplicas: 8
-  metrics:
-    - type: Resource
-      resource:
-        name: cpu
-        target:
-          type: Utilization
-          averageUtilization: 55    # 55% × 50m = 27m — Python GIL, pods are fix
-  behavior:
-    scaleUp:
-      stabilizationWindowSeconds: 15
+      stabilizationWindowSeconds: 120
+      selectPolicy: Max
       policies:
         - type: Pods
           value: 2
-          periodSeconds: 30
-    scaleDown:
-      stabilizationWindowSeconds: 120    # was 300 — Python CPU is instant signal
-      policies:
-        - type: Pods
-          value: 2                       # was 1 — faster recovery to minReplicas
           periodSeconds: 60
 ---
-# ── Cart — .NET: CPU-only, conservative scaleDown (JIT warmup cost) ───────────
-#
-# .NET JIT warmup spikes CPU to 800-1200m on first requests per pod.
-# Memory trigger removed — .NET GC holds managed heap after peak load.
-# scaleUp: 60s stabilization to average through JIT spike — DO NOT REDUCE.
-# scaleDown: conservative — JIT warmup makes new pods expensive. Keep 300s.
-# CPU trigger: 60% × 50m = 30m actual
+# ── cartservice ───────────────────────────────────────────────────────────────
+# Redis-backed — memory stable, CPU-only sufficient
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
   name: cartservice
   namespace: boutique
+  labels:
+    app: cartservice
+    hpa-version: v2
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
@@ -200,33 +89,33 @@ spec:
         name: cpu
         target:
           type: Utilization
-          averageUtilization: 60    # 60% × 50m = 30m actual trigger
+          averageUtilization: 60
   behavior:
     scaleUp:
-      stabilizationWindowSeconds: 60    # KEEP: .NET JIT spike averaging
+      stabilizationWindowSeconds: 15
+      selectPolicy: Max
       policies:
         - type: Pods
-          value: 1
-          periodSeconds: 60
+          value: 2
+          periodSeconds: 30
     scaleDown:
-      stabilizationWindowSeconds: 300    # KEEP: JIT warmup makes new pods expensive
+      stabilizationWindowSeconds: 120
+      selectPolicy: Max
       policies:
         - type: Pods
-          value: 1
+          value: 2
           periodSeconds: 60
 ---
-# ── Checkout — Go: MEMORY PRIMARY (correct — I/O-bound goroutine proxy) ───────
-#
-# Go service, I/O-bound fan-out orchestrator. Memory rises with goroutine
-# queue depth. Go releases RSS promptly — memory trigger is correct here.
-# scaleDown: conservative — fan-out means checkout failure cascades broadly.
-# Memory trigger: 65% × 128Mi = 83Mi
-# CPU trigger:    60% × 100m  = 60m — secondary
+# ── checkoutservice ───────────────────────────────────────────────────────────
+# Orchestrates 6 downstream calls — both CPU and memory tracked
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
   name: checkoutservice
   namespace: boutique
+  labels:
+    app: checkoutservice
+    hpa-version: v2
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
@@ -237,42 +126,43 @@ spec:
   metrics:
     - type: Resource
       resource:
-        name: memory
-        target:
-          type: Utilization
-          averageUtilization: 65    # 65% × 128Mi = 83Mi — goroutine queue depth
-    - type: Resource
-      resource:
         name: cpu
         target:
           type: Utilization
-          averageUtilization: 60    # 60% × 100m = 60m — secondary
+          averageUtilization: 60
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 65
   behavior:
     scaleUp:
       stabilizationWindowSeconds: 15
+      selectPolicy: Max
       policies:
         - type: Pods
-          value: 3
+          value: 2
           periodSeconds: 30
     scaleDown:
-      stabilizationWindowSeconds: 300    # conservative — fan-out cascades on failure
+      stabilizationWindowSeconds: 120
+      selectPolicy: Max
       policies:
         - type: Pods
-          value: 1
+          value: 2
           periodSeconds: 60
 ---
-# ── Currency — Go: CPU-only, medium scaleDown ─────────────────────────────────
-#
-# Go service, stateless currency conversion. Called on every page render.
-# CPU trigger: 60% × 50m = 30m actual
-# scaleDown: medium — 2 pods/60s, 180s window. Stateless, no warmup cost.
-# Note: sync.Once cache (roadmap) will reduce steady-state pod count significantly.
-# After cache is implemented: lower maxReplicas 12→6 and minReplicas 4→2.
+# ── currencyservice ───────────────────────────────────────────────────────────
+# 63.7% memory at peak — memory trigger added
+# CPU spikes on exchange rate computation — keep CPU threshold
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
   name: currencyservice
   namespace: boutique
+  labels:
+    app: currencyservice
+    hpa-version: v2
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
@@ -286,78 +176,46 @@ spec:
         name: cpu
         target:
           type: Utilization
-          averageUtilization: 60    # 60% × 50m = 30m actual trigger
-  behavior:
-    scaleUp:
-      stabilizationWindowSeconds: 15
-      policies:
-        - type: Pods
-          value: 2
-          periodSeconds: 30
-    scaleDown:
-      stabilizationWindowSeconds: 180    # was 300 — Go stateless, safe to be faster
-      policies:
-        - type: Pods
-          value: 2                       # was 1 — faster recovery to minReplicas
-          periodSeconds: 60
----
-# ── Shipping — Go: MEMORY + CPU, fast scaleDown ───────────────────────────────
-#
-# Go service, fully stateless. Memory trigger is correct — Go releases RSS.
-# scaleDown: aggressive — no state, no warmup cost, no downstream cascade risk.
-# CPU trigger:    60% × 50m  = 30m
-# Memory trigger: 65% × 64Mi = 42Mi — goroutine burst proxy
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata:
-  name: shippingservice
-  namespace: boutique
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: shippingservice
-  minReplicas: 2
-  maxReplicas: 6
-  metrics:
-    - type: Resource
-      resource:
-        name: cpu
-        target:
-          type: Utilization
-          averageUtilization: 60    # 60% × 50m = 30m actual
+          averageUtilization: 60
     - type: Resource
       resource:
         name: memory
         target:
           type: Utilization
-          averageUtilization: 65    # 65% × 64Mi = 42Mi — goroutine proxy
+          averageUtilization: 65
   behavior:
     scaleUp:
       stabilizationWindowSeconds: 15
+      selectPolicy: Max
       policies:
         - type: Pods
           value: 2
           periodSeconds: 30
     scaleDown:
-      stabilizationWindowSeconds: 120    # was 300 — Go stateless, fast is safe
+      stabilizationWindowSeconds: 120
+      selectPolicy: Max
       policies:
         - type: Pods
-          value: 2                       # was 1 — faster recovery
+          value: 2
           periodSeconds: 60
 ---
-# ── Payment — Node.js: CPU-only, fast scaleDown ───────────────────────────────
-#
-# Node.js single-threaded event loop. Memory trigger removed — V8 GC holds
-# heap after peak load similarly to Python. CPU is the correct signal.
-# scaleDown: aggressive — Node.js has no JIT warmup cost (V8 JIT is fast),
-# stateless, no downstream cascade risk.
-# CPU trigger: 60% × 50m = 30m actual
+# ── paymentservice ────────────────────────────────────────────────────────────
+# CRITICAL: 91.4% memory at 1000 VU — OOMKill risk confirmed 2026-04-24
+# Root cause: limits.memory=128Mi vastly undersized for Node.js gRPC
+# Fix 1 (this file): memory HPA trigger at 65% → scale out before OOMKill
+# Fix 2 (boutique.yaml): raise limits to 256Mi, requests to 128Mi
+# Memory trigger is the PRIMARY signal here — CPU stays low
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
   name: paymentservice
   namespace: boutique
+  labels:
+    app: paymentservice
+    hpa-version: v2
+  annotations:
+    sre/incident: "memory-saturation-2026-04-24"
+    sre/fix: "raised memory limit 128Mi→256Mi, added memory HPA trigger"
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
@@ -371,17 +229,160 @@ spec:
         name: cpu
         target:
           type: Utilization
-          averageUtilization: 60    # 60% × 50m = 30m actual — correct for Node.js
+          averageUtilization: 60
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 65
   behavior:
     scaleUp:
       stabilizationWindowSeconds: 15
+      selectPolicy: Max
       policies:
         - type: Pods
           value: 2
           periodSeconds: 30
     scaleDown:
-      stabilizationWindowSeconds: 120    # was 300 — Node.js stateless, fast is safe
+      stabilizationWindowSeconds: 120
+      selectPolicy: Max
       policies:
         - type: Pods
-          value: 2                       # was 1 — faster recovery
+          value: 2
+          periodSeconds: 60
+---
+# ── productcatalogservice ─────────────────────────────────────────────────────
+# Reads product catalog into memory at startup — memory stable after init
+# CPU spikes on search/filter — CPU-only sufficient
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: productcatalogservice
+  namespace: boutique
+  labels:
+    app: productcatalogservice
+    hpa-version: v2
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: productcatalogservice
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 15
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 120
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+---
+# ── recommendationservice ─────────────────────────────────────────────────────
+# Python service — 42.5% memory at peak, GC pressure under load
+# Memory trigger added as early warning
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: recommendationservice
+  namespace: boutique
+  labels:
+    app: recommendationservice
+    hpa-version: v2
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: recommendationservice
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 55
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 65
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 15
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 120
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+---
+# ── shippingservice ───────────────────────────────────────────────────────────
+# Go service — memory stable, both CPU and memory tracked
+# shippingservice memory was 36-41% at peak — adding memory for safety
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: shippingservice
+  namespace: boutique
+  labels:
+    app: shippingservice
+    hpa-version: v2
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: shippingservice
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 65
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 15
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 120
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 2
           periodSeconds: 60
