@@ -1,0 +1,54 @@
+# rbac.yaml — ServiceAccount + RBAC for k6 operator runners
+# =============================================================================
+# k6 Operator needs to create/manage runner pods in load-testing namespace.
+# Minimal permissions — principle of least privilege.
+# =============================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k6-runner
+  namespace: load-testing
+  labels:
+    app.kubernetes.io/part-of: sre-demo
+    app.kubernetes.io/component: load-testing
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: k6-runner
+  namespace: load-testing
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "configmaps", "secrets"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: k6-runner
+  namespace: load-testing
+subjects:
+  - kind: ServiceAccount
+    name: k6-runner
+    namespace: load-testing
+roleRef:
+  kind: Role
+  name: k6-runner
+  apiGroup: rbac.authorization.k8s.io
+---
+# Operator needs cross-namespace visibility to manage TestRun CRDs
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k6-operator-load-testing
+subjects:
+  - kind: ServiceAccount
+    name: k6-operator-controller-manager
+    namespace: k6-operator
+roleRef:
+  kind: ClusterRole
+  name: k6-operator-manager-role
+  apiGroup: rbac.authorization.k8s.io

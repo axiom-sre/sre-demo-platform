@@ -19,12 +19,36 @@
 #   p95: 838ms  p99: 1.74s  errors: 0.10%  availability: 99.982%
 #   HPA: currency → 11 pods, frontend → 9 pods
 #
-# USAGE:
-#   kubectl apply -f scripts/k6-job-1000vu.yaml
+# USAGE (full workflow):
+#   # Pre-flight
+#   kubectl get priorityclass boutique-background          # must exist
+#   kubectl top nodes                                      # metrics-server must be ready
+#   kubectl get hpa -n boutique                            # HPA must show TARGETS not <unknown>
+#
+#   # Deploy
+#   kubectl delete job k6-1000vu -n boutique --ignore-not-found
+#   kubectl delete configmap k6-script-1000vu -n boutique --ignore-not-found
+#   kubectl apply -f k6-job-1000vu.yaml
+#
+#   # Monitor (3 terminals)
 #   kubectl logs -f job/k6-1000vu -n boutique
-#   kubectl delete job k6-1000vu -n boutique        # cleanup after
-#   kubectl delete configmap k6-script-1000vu -n boutique
+#   watch -n 5 'kubectl get hpa -n boutique'
+#   watch -n 5 'kubectl top pods -n boutique --sort-by=cpu'
+#
+#   # Job auto-deletes 10min after completion (ttlSecondsAfterFinished: 600)
 # =============================================================================
+
+# ── PriorityClass (idempotent — safe to apply even if it already exists) ─────
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: boutique-background
+value: -10
+globalDefault: false
+preemptionPolicy: Never
+description: "Low-priority class for background load-testing jobs"
+---
+# ── ConfigMap: k6 test script ─────────────────────────────────────────────────
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -56,7 +80,7 @@ data:
         { duration: '2m',  target: 300  },  // HPA wave 2
         { duration: '2m',  target: 600  },  // mid plateau
         { duration: '2m',  target: 1000 },  // peak ramp
-        { duration: '5m',  target: 1000 },  // sustained peak — the money shot
+        { duration: '10m',  target: 1000 },  // sustained peak — the money shot
         { duration: '5m',  target: 0    },  // ramp down — watch HPA stabilization
       ],
       thresholds: {
@@ -122,6 +146,7 @@ data:
       });
     }
 ---
+# ── Job ───────────────────────────────────────────────────────────────────────
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -129,17 +154,24 @@ metadata:
   namespace: boutique
   labels:
     app: k6-loadtest
+    version: v10
 spec:
-  # 20min test + 5min buffer (warmup stage added = 20min total)
+  # 20min test + 5min buffer
   activeDeadlineSeconds: 1800
   # Don't restart on failure — k6 exit code 1 = threshold breach, not crash
   backoffLimit: 0
+  # Auto-cleanup 10min after completion (success or failure)
+  # Removes the need to manually delete job + pod after each run
+  ttlSecondsAfterFinished: 600
   template:
     metadata:
       labels:
         app: k6-loadtest
+        version: v10
     spec:
       restartPolicy: Never
+      # boutique-background PriorityClass is defined above in this file
+      # value: -10, preemptionPolicy: Never — k6 yields resources to boutique pods
       priorityClassName: boutique-background
       containers:
         - name: k6
