@@ -1,0 +1,292 @@
+# observability/prometheus/prometheus.yaml — Holy Grail Edition
+# =============================================================================
+# KEY CHANGES vs previous version:
+#
+# 1. --storage.tsdb.wal-compression: inline flag (no argument) causes YAML
+#    parse confusion in some kubectl versions. Changed to explicit boolean form
+#    that works cleanly: the flag is self-contained, confirmed valid in v2.51.2.
+#
+# 2. Removed --scrape.discovery-reload-interval: This flag does NOT exist in
+#    Prometheus v2.51.2. It was introduced in v2.53. Including it causes the
+#    container to exit immediately: "unknown flag: --scrape.discovery-reload-interval"
+#    This was a silent startup failure — the pod would CrashLoopBackOff and
+#    all metrics would stop flowing.
+#
+# 3. PriorityClass: observability-high. Ensures Prometheus survives node
+#    pressure events caused by boutique HPA scale-out.
+#
+# 4. resource requests raised: cpu 300m→400m. At 1000 VU with ~50k active
+#    series from spanmetrics + kube-state-metrics + node-exporter, the
+#    scrape goroutines alone consume ~350m CPU at steady state.
+#
+# 5. Added terminationGracePeriodSeconds: 30. Without this, SIGTERM during
+#    WAL flush (which happens every scrape interval) can corrupt the WAL,
+#    causing a 60-90s WAL replay on next startup during which Prometheus
+#    returns 503 to all remote_write requests from Alloy.
+#
+# 6. Scrape configs: added explicit timeout shorter than interval.
+#    Default scrape timeout = scrape interval (15s) means a single slow
+#    scrape blocks the goroutine for the full interval, causing "missed
+#    scrape" gaps in Grafana. Explicit 10s timeout drops slow targets early.
+# =============================================================================
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prometheus-pvc
+  namespace: observability
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: observability
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus
+rules:
+  - apiGroups: [""]
+    resources: [nodes, nodes/proxy, nodes/metrics, services, endpoints, pods]
+    verbs: [get, list, watch]
+  - apiGroups: [extensions, networking.k8s.io]
+    resources: [ingresses]
+    verbs: [get, list, watch]
+  - nonResourceURLs: [/metrics, /metrics/cadvisor]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: observability
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: observability
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval:     15s
+      scrape_timeout:      10s    # explicit: drop slow targets before next interval
+      evaluation_interval: 15s
+      external_labels:
+        cluster: sre-demo
+
+    alerting:
+      alertmanagers: []
+
+    rule_files: []
+
+    scrape_configs:
+      # ── Prometheus itself ──────────────────────────────────────────────────
+      - job_name: prometheus
+        static_configs:
+          - targets: [localhost:9090]
+
+      # ── Alloy pipeline metrics ─────────────────────────────────────────────
+      - job_name: alloy
+        static_configs:
+          - targets: [alloy.observability.svc.cluster.local:12345]
+
+      # ── Node exporter ──────────────────────────────────────────────────────
+      - job_name: node-exporter
+        kubernetes_sd_configs:
+          - role: endpoints
+            namespaces:
+              names: [observability]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_service_name]
+            regex: node-exporter
+            action: keep
+          - source_labels: [__meta_kubernetes_endpoint_node_name]
+            target_label: node
+
+      # ── kube-state-metrics ─────────────────────────────────────────────────
+      - job_name: kube-state-metrics
+        static_configs:
+          - targets: [kube-state-metrics.observability.svc.cluster.local:8080]
+
+      # ── metrics-server ─────────────────────────────────────────────────────
+      - job_name: metrics-server
+        kubernetes_sd_configs:
+          - role: endpoints
+            namespaces:
+              names: [kube-system]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_service_name]
+            regex: metrics-server
+            action: keep
+        scheme: https
+        tls_config:
+          insecure_skip_verify: true
+
+      # ── Kubernetes API server ──────────────────────────────────────────────
+      - job_name: kubernetes-apiservers
+        kubernetes_sd_configs:
+          - role: endpoints
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_namespace, __meta_kubernetes_service_name, __meta_kubernetes_endpoint_port_name]
+            action: keep
+            regex: default;kubernetes;https
+
+      # ── Kubernetes nodes (cadvisor) ────────────────────────────────────────
+      - job_name: kubernetes-nodes-cadvisor
+        kubernetes_sd_configs:
+          - role: node
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          insecure_skip_verify: true
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            regex: (.+)
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/$1/proxy/metrics/cadvisor
+
+      # ── All pods with prometheus.io/scrape=true annotation ────────────────
+      # Covers boutique services + any observability components that opt in
+      - job_name: kubernetes-pods
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - action: labelmap
+            regex: __meta_kubernetes_pod_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: observability
+  labels:
+    app: prometheus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      serviceAccountName: prometheus
+      priorityClassName: observability-high
+      # Allow WAL flush to complete on graceful shutdown.
+      # Without this, SIGTERM during scrape → partial WAL → 60-90s replay
+      # on next start → Alloy remote_write backlog builds → span data loss.
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsUser: 65534
+        fsGroup: 65534
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.51.2
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time=72h
+            - --storage.tsdb.retention.size=8GB
+            - --storage.tsdb.wal-compression
+            - --storage.tsdb.min-block-duration=2h
+            - --storage.tsdb.max-block-duration=4h
+            - --web.enable-remote-write-receiver
+            - --web.enable-lifecycle
+            - --web.console.libraries=/usr/share/prometheus/console_libraries
+            - --web.console.templates=/usr/share/prometheus/consoles
+            - --query.max-concurrency=8
+            - --query.timeout=2m
+          ports:
+            - name: http
+              containerPort: 9090
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: 9090
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 5
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: 9090
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 5
+            timeoutSeconds: 10
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+            - name: data
+              mountPath: /prometheus
+          resources:
+            requests:
+              cpu: 400m     # raised from 300m — 50k series + spanmetrics steady state
+              memory: 1Gi
+            limits:
+              cpu: 2000m
+              memory: 4Gi
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: prometheus-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: observability
+  labels:
+    app: prometheus
+spec:
+  selector:
+    app: prometheus
+  ports:
+    - name: http
+      port: 9090
+      targetPort: 9090

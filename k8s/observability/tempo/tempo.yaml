@@ -1,0 +1,207 @@
+# observability/tempo/tempo.yaml — Holy Grail Edition v2
+# =============================================================================
+# FIXES IN THIS VERSION:
+#
+# FIX 1 — OOMKill (exit 137) — memory limit 2Gi → 3Gi
+#   Measured: Tempo sits at 786Mi at idle with 1000VU history in the ingester.
+#   The OOMKill happened at 13:28 after a 29-minute run — consistent with the
+#   ingester WAL filling up during the 1000VU load test. The ingester holds ALL
+#   unflushed spans in memory until max_block_duration (10m) elapses. At 1000VU
+#   with ~363 req/s and ~8 spans/request = ~2900 spans/sec × 600s flush window
+#   = ~1.7M spans in memory at peak. Each span ~800 bytes = ~1.4Gi. Add the
+#   service-graphs edge cache (see FIX 2), compactor overhead, and Go runtime:
+#   2Gi was the hard floor, not the headroom. 3Gi gives genuine buffer.
+#   Memory request raised to 1Gi to get better scheduling QoS.
+#
+# FIX 2 — service-graphs dropping spans (maxItems=10000 → 100000)
+#   The service-graphs processor builds a graph of service→service edges by
+#   holding incomplete request pairs in memory until both client+server spans
+#   arrive. maxItems caps how many incomplete edges fit in the cache at once.
+#   At 1000VU with 11 boutique services each making multiple downstream calls,
+#   the fan-out generates ~15-25 concurrent incomplete edges per request.
+#   1000VU × 25 edges = 25000 concurrent edges minimum. maxItems=10000 meant
+#   60%+ of edges were evicted before the matching span arrived → dropped.
+#   The log showed this clearly: "dropped 4511 spans", "dropped 3889 spans"
+#   every single second during the load test.
+#   Fix: max_items=100000 (100K). Memory cost: ~100K edges × ~200 bytes = 20MB.
+#   Completely acceptable within the new 3Gi limit.
+#
+# FIX 3 — max_block_duration 10m → 5m
+#   Shorter flush interval means less data in the ingester WAL at any moment.
+#   At 1000VU, 5m flush window holds ~870K spans vs 1.7M at 10m.
+#   Halves peak ingester memory. Compaction runs more frequently but each
+#   compaction job is smaller → less lock contention → no 503 storms.
+#
+# UNCHANGED: storage backend (local PVC), OTLP ports, Prometheus remote_write,
+# overrides processors list, compactor retention config.
+# =============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tempo-config
+  namespace: observability
+data:
+  tempo.yaml: |
+    server:
+      http_listen_port: 3200
+      log_level: warn
+
+    distributor:
+      receivers:
+        otlp:
+          protocols:
+            grpc:
+              endpoint: "0.0.0.0:4317"
+            http:
+              endpoint: "0.0.0.0:4318"
+
+    ingester:
+      trace_idle_period:     20s
+      flush_all_on_shutdown: true
+      max_block_duration:    5m    # FIX 3: was 10m — halves peak WAL memory
+
+    compactor:
+      compaction:
+        block_retention:           72h
+        compacted_block_retention: 1h
+        compaction_window:         1h
+        max_compaction_objects:    1000000
+        max_block_bytes:           104857600   # 100MiB
+        retention_concurrency:     10
+
+    metrics_generator:
+      registry:
+        external_labels:
+          source:  tempo
+          cluster: sre-demo
+      processor:
+        service_graphs:
+          # FIX 2: was 10000 — at 1000VU this caused 60%+ span drops.
+          # 100K edges × ~200 bytes = ~20MB. Fine within 3Gi limit.
+          max_items: 100000
+          # Wait up to 10s for the matching span before evicting an edge.
+          # Default is 10s — explicit here for documentation.
+          wait: 10s
+        span_metrics:
+          # Histogram buckets matching Alloy's spanmetrics connector
+          # for consistent latency data across both pipelines.
+          histogram_buckets: [0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.4, 0.8, 1.5, 3.0, 5.0]
+      storage:
+        path: /var/tempo/generator/wal
+        remote_write:
+          - url: http://prometheus.observability.svc.cluster.local:9090/api/v1/write
+            send_exemplars: true
+
+    storage:
+      trace:
+        backend: local
+        wal:
+          path: /var/tempo/wal
+        local:
+          path: /var/tempo/blocks
+
+    overrides:
+      metrics_generator_processors: [service-graphs, span-metrics]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tempo-pvc
+  namespace: observability
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 15Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tempo
+  namespace: observability
+  labels:
+    app: tempo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tempo
+  template:
+    metadata:
+      labels:
+        app: tempo
+    spec:
+      priorityClassName: observability-high
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsUser: 0
+        fsGroup:   0
+      containers:
+        - name: tempo
+          image: grafana/tempo:2.4.1
+          args: [-config.file=/etc/tempo/tempo.yaml]
+          ports:
+            - name: http
+              containerPort: 3200
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+          readinessProbe:
+            httpGet:
+              path:   /ready
+              port:   3200
+            initialDelaySeconds: 15
+            periodSeconds:       10
+            failureThreshold:    5
+            timeoutSeconds:      5
+          livenessProbe:
+            httpGet:
+              path:   /ready
+              port:   3200
+            initialDelaySeconds: 30
+            periodSeconds:       20
+            failureThreshold:    5
+            timeoutSeconds:      10
+          volumeMounts:
+            - name:      config
+              mountPath: /etc/tempo
+            - name:      data
+              mountPath: /var/tempo
+          resources:
+            requests:
+              cpu:    300m
+              memory: 1Gi    # raised from 768Mi — better scheduling QoS
+            limits:
+              cpu:    1500m
+              memory: 3Gi    # FIX 1: raised from 2Gi — measured peak 1.4-1.6Gi + headroom
+      volumes:
+        - name: config
+          configMap:
+            name: tempo-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: tempo-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tempo
+  namespace: observability
+  labels:
+    app: tempo
+spec:
+  selector:
+    app: tempo
+  ports:
+    - name: http
+      port: 3200
+      targetPort: 3200
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+    - name: otlp-http
+      port: 4318
+      targetPort: 4318

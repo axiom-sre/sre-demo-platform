@@ -1,0 +1,102 @@
+# namespaces/namespaces.yaml
+# =============================================================================
+# SINGLE SOURCE OF TRUTH for namespaces and ResourceQuotas.
+# boutique.yaml does NOT define quotas — they live here exclusively.
+# =============================================================================
+#
+# ResourceQuota rationale — M5 Pro 14" 64GB / 8 vCPU node:
+#
+# Total node capacity: 8 CPU (8000m), ~60GB usable RAM
+#
+# BOUTIQUE namespace — v6 node budget at MAX HPA replicas:
+#   frontend:      10 × 50m  =  500m  requests
+#   productcat:     6 × 30m  =  180m
+#   cart:           5 × 50m  =  250m
+#   checkout:       6 × 25m  =  150m
+#   currency:      10 × 15m  =  150m
+#   recommend:      5 × 25m  =  125m
+#   adservice:      1 × 30m  =   30m
+#   fixed svcs:               ~155m  (redis/email/payment/shipping)
+#   ─────────────────────────────────
+#   Total boutique:          ~1540m  requests at full HPA expansion
+#
+# WHY requests.cpu="16" (not "4" or "1.54"):
+#   The quota is not a target — it is a ceiling.
+#   "4" was introduced in boutique.yaml v5 and caused a real incident:
+#   at 300 VU, HPA tried to schedule 8 new pods × 50m = 400m, pushing
+#   total requests over 4000m → quota admission rejection → pods Pending
+#   → HPA could not scale → services saturated → cascade failure.
+#
+#   "16" gives HPA full room to double all services simultaneously
+#   without hitting the scheduler wall. We have 8 CPU on the node —
+#   16 CPU requests is fine because limits (32) are the actual safety net.
+#   The scheduler uses requests for bin-packing, not limits.
+#
+# OBSERVABILITY namespace — v2 quota rationale:
+#   The original 12Gi limits / 4Gi requests quota was calculated before
+#   Tempo was raised to 3Gi (OOMKill fix) and Prometheus kept at 4Gi.
+#   At 9.6Gi used, Prometheus could not restart after a rolling update
+#   because the new replicaset needed 4Gi → total would exceed 12Gi.
+#
+#   Component breakdown (limits):
+#     Alloy            2Gi
+#     Grafana          1Gi
+#     kube-state-metrics 256Mi
+#     Loki             1Gi
+#     node-exporter    128Mi
+#     Prometheus       4Gi
+#     Tempo            3Gi
+#     ─────────────────────
+#     Subtotal:       ~11.4Gi
+#
+#   20Gi gives headroom for:
+#     - Prometheus rolling restarts (brief double-count of 4Gi limit)
+#     - Pyroscope profiler (Day 13 roadmap) ~1Gi
+#     - Alertmanager (Day 4 roadmap)        ~256Mi
+#     - Any future additions without hitting quota again
+#
+#   requests.cpu raised 3→6: Prometheus + Alloy at 1000VU steady state
+#   consume ~1.9Gi requests together. 6 gives room for Pyroscope + AM.
+# =============================================================================
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: boutique
+  labels:
+    name: boutique
+    platform: sre-demo
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: boutique-quota
+  namespace: boutique
+spec:
+  hard:
+    requests.cpu: "16"       # ceiling — HPA can scale all services to max simultaneously
+    limits.cpu: "32"         # hard safety net against node saturation
+    requests.memory: "20Gi"  # generous — M5 Pro has 64GB, memory is not the constraint
+    limits.memory: "40Gi"
+    pods: "60"               # prevents runaway HPA from infinite pod scheduling
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: observability
+  labels:
+    name: observability
+    platform: sre-demo
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: observability-quota
+  namespace: observability
+spec:
+  hard:
+    requests.cpu: "6"         # raised from 3 — Prometheus+Alloy at 1000VU = ~1.9 CPU
+    limits.cpu: "12"          # unchanged — Prometheus + Alloy peak during compaction
+    requests.memory: "8Gi"    # raised from 4Gi — fits all components + rolling restarts
+    limits.memory: "20Gi"     # raised from 12Gi — Tempo 3Gi + Prometheus 4Gi + headroom
+    pods: "20"

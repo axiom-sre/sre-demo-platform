@@ -1,0 +1,388 @@
+# hpa.yaml — Boutique HPA definitions (all services)
+# =============================================================================
+# VERSION HISTORY:
+#   v1 — CPU-only HPA on all services
+#   v2 — Added memory triggers to memory-sensitive services
+#        paymentservice: 91.4% memory observed at 1000 VU (2026-04-24)
+#        emailservice:   63.8% memory observed at 1000 VU
+#        currencyservice: 63.7% memory observed at 1000 VU
+#        adservice:      54.3% memory observed at 1000 VU
+#
+# SCALING PHILOSOPHY:
+#   - Scale up fast (15s stabilization, +2 pods per 30s)
+#   - Scale down slow (120s stabilization) — avoids thrash
+#   - Memory threshold at 65% — gives headroom before OOMKill
+#   - CPU threshold tuned per service characteristics
+#
+# CAPACITY BASELINE (2026-04-24 capacity test):
+#   Safe operating point: 500 VU / 6,200 req/s
+#   Saturation point:     600 VU / 7,000 req/s
+#   paymentservice OOMKill risk confirmed at 1000 VU
+# =============================================================================
+
+# ── frontend ──────────────────────────────────────────────────────────────────
+# Memory added: frontend hits 36% at 1000 VU — not critical but worth tracking
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: frontend
+  namespace: boutique
+  labels:
+    app: frontend
+    hpa-version: v2
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: frontend
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 60
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 15
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 120
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+---
+# ── cartservice ───────────────────────────────────────────────────────────────
+# Redis-backed — memory stable, CPU-only sufficient
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: cartservice
+  namespace: boutique
+  labels:
+    app: cartservice
+    hpa-version: v2
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: cartservice
+  minReplicas: 2
+  maxReplicas: 12
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 15
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 120
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+---
+# ── checkoutservice ───────────────────────────────────────────────────────────
+# Orchestrates 6 downstream calls — both CPU and memory tracked
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: checkoutservice
+  namespace: boutique
+  labels:
+    app: checkoutservice
+    hpa-version: v2
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: checkoutservice
+  minReplicas: 4
+  maxReplicas: 12
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 65
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 15
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 120
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+---
+# ── currencyservice ───────────────────────────────────────────────────────────
+# 63.7% memory at peak — memory trigger added
+# CPU spikes on exchange rate computation — keep CPU threshold
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: currencyservice
+  namespace: boutique
+  labels:
+    app: currencyservice
+    hpa-version: v2
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: currencyservice
+  minReplicas: 4
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 65
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 15
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 120
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+---
+# ── paymentservice ────────────────────────────────────────────────────────────
+# CRITICAL: 91.4% memory at 1000 VU — OOMKill risk confirmed 2026-04-24
+# Root cause: limits.memory=128Mi vastly undersized for Node.js gRPC
+# Fix 1 (this file): memory HPA trigger at 65% → scale out before OOMKill
+# Fix 2 (boutique.yaml): raise limits to 256Mi, requests to 128Mi
+# Memory trigger is the PRIMARY signal here — CPU stays low
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: paymentservice
+  namespace: boutique
+  labels:
+    app: paymentservice
+    hpa-version: v2
+  annotations:
+    sre/incident: "memory-saturation-2026-04-24"
+    sre/fix: "raised memory limit 128Mi→256Mi, added memory HPA trigger"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: paymentservice
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 65
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 15
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 120
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+---
+# ── productcatalogservice ─────────────────────────────────────────────────────
+# Reads product catalog into memory at startup — memory stable after init
+# CPU spikes on search/filter — CPU-only sufficient
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: productcatalogservice
+  namespace: boutique
+  labels:
+    app: productcatalogservice
+    hpa-version: v2
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: productcatalogservice
+  minReplicas: 2
+  maxReplicas: 16
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 15
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 120
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+---
+# ── recommendationservice ─────────────────────────────────────────────────────
+# Python service — 42.5% memory at peak, GC pressure under load
+# Memory trigger added as early warning
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: recommendationservice
+  namespace: boutique
+  labels:
+    app: recommendationservice
+    hpa-version: v2
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: recommendationservice
+  minReplicas: 2
+  maxReplicas: 12
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 55
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 65
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 15
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 120
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+---
+# ── shippingservice ───────────────────────────────────────────────────────────
+# Go service — memory stable, both CPU and memory tracked
+# shippingservice memory was 36-41% at peak — adding memory for safety
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: shippingservice
+  namespace: boutique
+  labels:
+    app: shippingservice
+    hpa-version: v2
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: shippingservice
+  minReplicas: 2
+  maxReplicas: 12
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 65
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 15
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 120
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60

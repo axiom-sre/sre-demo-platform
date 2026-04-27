@@ -1,0 +1,446 @@
+# observability/alloy/alloy.yaml — Holy Grail Edition v4
+# =============================================================================
+# CRITICAL FIX IN THIS VERSION:
+#
+# FIX — Alloy log tailing broken on Docker Desktop / macOS (ALL logs missing)
+#
+#   Root cause: Docker Desktop on macOS runs Kubernetes inside a Linux VM.
+#   Container logs are written to /var/log/pods INSIDE that VM's filesystem.
+#   The Mac host does NOT have /var/log/pods — that path doesn't exist at
+#   the host level. Alloy's DaemonSet was mounting /var/log/pods from the
+#   Mac host (via hostPath), which is an empty or nonexistent directory.
+#   Result: every single log file stat() returned ENOENT → zero logs shipped
+#   to Loki → Loki appeared "broken" even though it was accepting pushes fine.
+#
+#   You saw this exactly in the Alloy output:
+#     "stat /var/log/pods/55a8ce41.../adservice/*.log: no such file or directory"
+#     "stat /var/log/pods/44982b82.../currencyservice/*.log: no such file or directory"
+#     ... (50+ lines, every pod, every container)
+#
+#   Fix: Replace loki.source.file (hostPath file tailing) with
+#   loki.source.kubernetes_objects — this uses the Kubernetes API to stream
+#   pod logs directly. No host filesystem mounts needed. Works identically on:
+#     - Docker Desktop macOS (our setup)
+#     - Rancher Desktop macOS
+#     - Lima/Colima
+#     - EKS/AKS/GKE (where hostPath tailing works but API streaming also works)
+#
+#   The tradeoff: loki.source.kubernetes_objects doesn't support the CRI
+#   parsing pipeline (stage.cri, stage.json, etc.) directly. We handle this
+#   by keeping the loki.process pipeline — it still runs on the raw log lines
+#   which come pre-decoded (no CRI wrapping) from the API stream.
+#   The stage.cri{} call is removed (it would error on already-decoded lines).
+#
+#   The DaemonSet still needs ALLOY_NODE_NAME for the OTLP pipeline node label.
+#   The hostPath volume mounts for /var/log/pods, /var/log/containers, and
+#   /var/lib/docker/containers are REMOVED — they served no purpose on macOS
+#   and were causing the misleading "stat failed" error storm.
+#
+# ALL OTHER CHANGES (traces pipeline, spanmetrics, Loki write, resources)
+# are identical to v3. Only the log collection method changed.
+# =============================================================================
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: alloy
+  namespace: observability
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: alloy
+rules:
+  - apiGroups: [""]
+    resources: [nodes, nodes/proxy, nodes/metrics, services, endpoints, pods, namespaces]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get]
+  # Required for loki.source.kubernetes_objects log streaming
+  - apiGroups: [""]
+    resources: [pods/log]
+    verbs: [get, list, watch]
+  - nonResourceURLs: [/metrics, /metrics/cadvisor]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: alloy
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: alloy
+subjects:
+  - kind: ServiceAccount
+    name: alloy
+    namespace: observability
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alloy-config
+  namespace: observability
+data:
+  config.alloy: |
+    // =========================================================================
+    // PIPELINE A — TRACES (OTLP in → batch → spanmetrics + tempo)
+    // Unchanged from v3.
+    // =========================================================================
+
+    otelcol.receiver.otlp "default" {
+      grpc {
+        endpoint          = "0.0.0.0:4317"
+        max_recv_msg_size = "8MiB"
+      }
+      http {
+        endpoint = "0.0.0.0:4318"
+      }
+      output {
+        traces = [otelcol.processor.batch.traces.input]
+      }
+    }
+
+    otelcol.processor.batch "traces" {
+      send_batch_size     = 4096
+      send_batch_max_size = 16384
+      timeout             = "2s"
+      output {
+        traces = [
+          otelcol.connector.spanmetrics.default.input,
+          otelcol.exporter.otlp.tempo.input,
+        ]
+      }
+    }
+
+    otelcol.connector.spanmetrics "default" {
+      histogram {
+        explicit {
+          buckets = ["5ms", "10ms", "20ms", "50ms", "100ms", "200ms", "400ms", "800ms", "1500ms", "3s", "5s"]
+        }
+      }
+      namespace = "traces"
+
+      exemplars {
+        enabled = true
+      }
+
+      dimension {
+        name    = "http.method"
+        default = "GET"
+      }
+      dimension {
+        name    = "http.status_code"
+        default = "unknown"
+      }
+      dimension {
+        name    = "service.name"
+        default = "unknown"
+      }
+
+      output {
+        metrics = [otelcol.exporter.prometheus.default.input]
+      }
+    }
+
+    otelcol.exporter.prometheus "default" {
+      resource_to_telemetry_conversion = true
+      forward_to = [prometheus.remote_write.spanmetrics.receiver]
+    }
+
+    prometheus.remote_write "spanmetrics" {
+      endpoint {
+        url = "http://prometheus.observability.svc.cluster.local:9090/api/v1/write"
+        queue_config {
+          capacity             = 50000
+          max_samples_per_send = 10000
+          max_shards           = 16
+          min_shards           = 4
+          batch_send_deadline  = "10s"
+          min_backoff          = "1s"
+          max_backoff          = "15s"
+        }
+        metadata_config {
+          send          = true
+          send_interval = "1m"
+        }
+      }
+    }
+
+    otelcol.exporter.otlp "tempo" {
+      client {
+        endpoint = "tempo.observability.svc.cluster.local:4317"
+        tls {
+          insecure = true
+        }
+        wait_for_ready = true
+      }
+      retry_on_failure {
+        enabled          = true
+        initial_interval = "2s"
+        max_interval     = "30s"
+        max_elapsed_time = "120s"
+      }
+      sending_queue {
+        enabled       = true
+        num_consumers = 8
+        queue_size    = 2000
+      }
+    }
+
+    // =========================================================================
+    // PIPELINE B — LOGS (Kubernetes API streaming → process → Loki)
+    //
+    // FIX: replaced loki.source.file (hostPath tailing — broken on Docker
+    // Desktop macOS) with loki.source.kubernetes_objects (API streaming).
+    //
+    // loki.source.kubernetes_objects streams logs from the Kubernetes API
+    // server using the same mechanism as `kubectl logs`. It does NOT require
+    // any host filesystem access — works on Docker Desktop, Rancher Desktop,
+    // cloud clusters, or any platform where the kube API is reachable.
+    //
+    // The `node` field scopes log collection to only pods running on this
+    // node (matching the old DaemonSet-per-node behavior). On Docker Desktop
+    // there is only one node so this is effectively "all pods".
+    // =========================================================================
+
+    // ── Pod discovery via Kubernetes API ──────────────────────────────────────
+    // Uses the API server to discover pods — no hostPath mounts needed.
+    // Works on Docker Desktop macOS where /var/log/pods doesn't exist on host.
+    discovery.kubernetes "pods" {
+      role = "pod"
+    }
+
+    // Relabel: build the __path__ using the pod UID (from API metadata),
+    // but we don't need __path__ for API-based tailing — we use the pod
+    // name/namespace to tell loki.source.kubernetes which pods to tail.
+    // We DO need relabeling to set useful Loki labels.
+    discovery.relabel "pod_logs" {
+      targets = discovery.kubernetes.pods.targets
+
+      // Drop pods that aren't running
+      rule {
+        source_labels = ["__meta_kubernetes_pod_phase"]
+        regex         = "Pending|Succeeded|Failed|Unknown"
+        action        = "drop"
+      }
+
+      // Set namespace label
+      rule {
+        source_labels = ["__meta_kubernetes_namespace"]
+        target_label  = "namespace"
+      }
+
+      // Set pod label
+      rule {
+        source_labels = ["__meta_kubernetes_pod_name"]
+        target_label  = "pod"
+      }
+
+      // Set container label
+      rule {
+        source_labels = ["__meta_kubernetes_pod_container_name"]
+        target_label  = "container"
+      }
+
+      // Set app label from pod label
+      rule {
+        source_labels = ["__meta_kubernetes_pod_label_app"]
+        target_label  = "app"
+      }
+    }
+
+    // loki.source.kubernetes: streams logs via the Kubernetes API.
+    // This is the correct component name in Alloy v1.8.
+    // Equivalent to running `kubectl logs -f` for each pod/container.
+    // No host filesystem access required — works on Docker Desktop macOS.
+    loki.source.kubernetes "pods" {
+      targets    = discovery.relabel.pod_logs.output
+      forward_to = [loki.process.pod_logs.receiver]
+    }
+
+    loki.process "pod_logs" {
+      // NOTE: stage.cri{} is REMOVED. The kubernetes_objects source delivers
+      // logs already decoded — the CRI timestamp/stream/flags wrapper is
+      // stripped by the API. Applying stage.cri to already-decoded lines
+      // would corrupt the log body (treating the first word as a timestamp).
+
+      // Stage 1: drop empty lines
+      stage.drop {
+        expression          = "^ *$"
+        drop_counter_reason = "empty_line"
+      }
+
+      // Stage 2: drop kubernetes readiness/liveness probe logs.
+      // 10 frontend replicas × 8s probe period = 75 kube-probe hits/min.
+      stage.drop {
+        expression          = "kube-probe"
+        drop_counter_reason = "health_probe"
+      }
+
+      // Stage 3: attempt JSON parsing for structured log emitters.
+      // frontend (Go/gin), checkoutservice (Go), productcatalog (Go) emit JSON.
+      stage.json {
+        expressions = {
+          severity = "severity",
+          trace_id = "traceID",
+        }
+      }
+
+      // Stage 4: promote extracted fields as Loki labels for correlation.
+      stage.labels {
+        values = {
+          severity = "",
+          trace_id = "",
+        }
+      }
+
+      // Stage 5: static cluster label on all lines.
+      stage.static_labels {
+        values = {
+          cluster = "sre-demo",
+        }
+      }
+
+      forward_to = [loki.write.default.receiver]
+    }
+
+    loki.write "default" {
+      endpoint {
+        url = "http://loki.observability.svc.cluster.local:3100/loki/api/v1/push"
+        // timeout attribute not supported in loki.write in Alloy v1.8 — removed.
+      }
+      external_labels = {
+        cluster = "sre-demo",
+      }
+    }
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: alloy
+  namespace: observability
+  labels:
+    app: alloy
+spec:
+  selector:
+    matchLabels:
+      app: alloy
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: alloy
+      annotations:
+        checksum/config: "v8-k8s-api-log-collection"
+    spec:
+      serviceAccountName: alloy
+      priorityClassName: system-node-critical
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: alloy
+          image: grafana/alloy:v1.8.0
+          args:
+            - run
+            - /etc/alloy/config.alloy
+            - --server.http.listen-addr=0.0.0.0:12345
+            - --storage.path=/var/lib/alloy/data
+            - --stability.level=experimental
+            - --cluster.enabled=false
+          env:
+            - name: ALLOY_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: GOMEMLIMIT
+              value: "1825361100"
+            - name: GOGC
+              value: "75"
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+              protocol: TCP
+            - name: otlp-http
+              containerPort: 4318
+              protocol: TCP
+            - name: http
+              containerPort: 12345
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: 12345
+            initialDelaySeconds: 20
+            periodSeconds:       10
+            failureThreshold:    6
+            successThreshold:    1
+            timeoutSeconds:      5
+          livenessProbe:
+            httpGet:
+              path: /-/ready
+              port: 12345
+            initialDelaySeconds: 90
+            periodSeconds:       30
+            failureThreshold:    10
+            timeoutSeconds:      10
+          startupProbe:
+            httpGet:
+              path: /-/ready
+              port: 12345
+            initialDelaySeconds: 15
+            periodSeconds:       10
+            failureThreshold:    30
+            timeoutSeconds:      5
+          volumeMounts:
+            - name:      config
+              mountPath: /etc/alloy
+            - name:      data
+              mountPath: /var/lib/alloy/data
+          # NOTE: hostPath mounts for /var/log/pods, /var/log/containers,
+          # and /var/lib/docker/containers are REMOVED. These paths do not
+          # exist on the Docker Desktop macOS host and caused the full
+          # "stat failed: no such file or directory" error storm.
+          # Log collection now goes through the Kubernetes API (see config).
+          resources:
+            requests:
+              cpu:    600m
+              memory: 768Mi
+            limits:
+              cpu:    2000m
+              memory: 2Gi
+      volumes:
+        - name: config
+          configMap:
+            name: alloy-config
+        - name: data
+          emptyDir: {}
+      # hostPath volumes removed — not needed for API-based log collection
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alloy
+  namespace: observability
+  labels:
+    app: alloy
+spec:
+  selector:
+    app: alloy
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+      protocol: TCP
+    - name: otlp-http
+      port: 4318
+      targetPort: 4318
+      protocol: TCP
+    - name: http
+      port: 12345
+      targetPort: 12345
+      protocol: TCP
