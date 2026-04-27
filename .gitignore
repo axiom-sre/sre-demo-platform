@@ -103,3 +103,5 @@ logs/
 *.orig
 *.backup
 *.old
+.DS_Store
+**/.DS_Store
