@@ -34,11 +34,14 @@ const PRODUCTS = [
 
 export const options = {
   stages: [
-    { duration: '1m', target: 50 },
-    { duration: '2m', target: 500 },
-    { duration: '2m', target: 1000 },            
-    { duration: '5m',  target: 1000 },
-    { duration: '2m', target: 0  },
+    { duration: '1m', target: 10 },
+    { duration: '1m', target: 500 },
+    { duration: '1m', target: 500 },
+    { duration: '1m', target: 750 },
+    { duration: '5m', target: 750 },
+    { duration: '1m', target: 1000 },
+    { duration: '5m', target: 1000 },
+    { duration: '1m', target: 0  },
   ],
   thresholds: {
     http_req_failed:   ['rate<0.001'],
