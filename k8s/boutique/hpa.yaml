@@ -36,7 +36,7 @@ spec:
     kind: Deployment
     name: frontend
   minReplicas: 3
-  maxReplicas: 20
+  maxReplicas: 24
   metrics:
     - type: Resource
       resource:
@@ -49,7 +49,7 @@ spec:
         name: memory
         target:
           type: Utilization
-          averageUtilization: 60
+          averageUtilization: 75
   behavior:
     scaleUp:
       stabilizationWindowSeconds: 15
@@ -82,7 +82,7 @@ spec:
     kind: Deployment
     name: cartservice
   minReplicas: 2
-  maxReplicas: 12
+  maxReplicas: 16
   metrics:
     - type: Resource
       resource:
@@ -121,8 +121,8 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: checkoutservice
-  minReplicas: 4
-  maxReplicas: 12
+  minReplicas: 2
+  maxReplicas: 10
   metrics:
     - type: Resource
       resource:
@@ -135,7 +135,7 @@ spec:
         name: memory
         target:
           type: Utilization
-          averageUtilization: 65
+          averageUtilization: 80
   behavior:
     scaleUp:
       stabilizationWindowSeconds: 15
@@ -169,7 +169,7 @@ spec:
     kind: Deployment
     name: currencyservice
   minReplicas: 4
-  maxReplicas: 20
+  maxReplicas: 24
   metrics:
     - type: Resource
       resource:
@@ -182,7 +182,7 @@ spec:
         name: memory
         target:
           type: Utilization
-          averageUtilization: 65
+          averageUtilization: 80
   behavior:
     scaleUp:
       stabilizationWindowSeconds: 15
@@ -222,7 +222,7 @@ spec:
     kind: Deployment
     name: paymentservice
   minReplicas: 2
-  maxReplicas: 10
+  maxReplicas: 6
   metrics:
     - type: Resource
       resource:
@@ -235,7 +235,7 @@ spec:
         name: memory
         target:
           type: Utilization
-          averageUtilization: 65
+          averageUtilization: 80
   behavior:
     scaleUp:
       stabilizationWindowSeconds: 15
@@ -268,15 +268,15 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: productcatalogservice
-  minReplicas: 2
-  maxReplicas: 16
+  minReplicas: 4
+  maxReplicas: 24
   metrics:
     - type: Resource
       resource:
         name: cpu
         target:
           type: Utilization
-          averageUtilization: 50
+          averageUtilization: 60
   behavior:
     scaleUp:
       stabilizationWindowSeconds: 15
@@ -309,8 +309,8 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: recommendationservice
-  minReplicas: 2
-  maxReplicas: 12
+  minReplicas: 4
+  maxReplicas: 20
   metrics:
     - type: Resource
       resource:
@@ -323,7 +323,7 @@ spec:
         name: memory
         target:
           type: Utilization
-          averageUtilization: 65
+          averageUtilization: 80
   behavior:
     scaleUp:
       stabilizationWindowSeconds: 15
@@ -357,7 +357,7 @@ spec:
     kind: Deployment
     name: shippingservice
   minReplicas: 2
-  maxReplicas: 12
+  maxReplicas: 6
   metrics:
     - type: Resource
       resource:
@@ -370,7 +370,7 @@ spec:
         name: memory
         target:
           type: Utilization
-          averageUtilization: 65
+          averageUtilization: 75
   behavior:
     scaleUp:
       stabilizationWindowSeconds: 15
