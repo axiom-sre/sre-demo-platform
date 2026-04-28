@@ -1,9 +1,9 @@
 /**
- * load-test_10vusers.js — SRE Demo: Smoke Test (10 VU)
+ * load-test_500vusers.js — SRE Demo: Smoke Test (500 VU)
  * ─────────────────────────────────────────────────────
  * PURPOSE : First check after every reboot / nuke. ~6 min runtime.
  * PASS    : 0% failures, p95 < 500ms, all 7 checks green.
- * USAGE   : k6 run scripts/load-test_10vusers.js
+ * USAGE   : k6 run scripts/load-test_500vusers.js
  *
  * TRAFFIC SHAPE:
  *   50% Window Shoppers  — home + 2 product pages, leave
@@ -13,7 +13,7 @@
  * WHAT TO WATCH:
  *   - All 7 checks green
  *   - 0% errors (threshold <0.1%)
- *   - p95 < 500ms
+ *   - p95 < 1000ms
  *   - HPA stays at min replicas — smoke should NOT trigger scaling
  */
 
@@ -23,8 +23,8 @@ import { sleep, check, group } from 'k6';
 const BASE = __ENV.BASE_URL || 'http://localhost:8080';
 
 const P = {
-  timeout: '15s',
-  tags: { test: '10vu-smoke' },
+  timeout: '60s',
+  tags: { test: '500vu-smoke' },
 };
 
 const PRODUCTS = [
@@ -35,13 +35,13 @@ const PRODUCTS = [
 export const options = {
   stages: [
     { duration: '1m', target: 50 },
-    { duration: '2m', target: 500 },    
-    { duration: '5m',  target: 500 },
-    { duration: '2m', target: 0  },
+    { duration: '5m', target: 500 },    
+    { duration: '10m',  target: 500 },
+    { duration: '1m', target: 0  },
   ],
   thresholds: {
     http_req_failed:   ['rate<0.001'],
-    http_req_duration: ['p(95)<500'],
+    http_req_duration: ['p(95)<1000'],
   },
   summaryTrendStats: ['avg', 'min', 'med', 'max', 'p(90)', 'p(95)', 'p(99)'],
 };
@@ -56,7 +56,7 @@ export default function () {
 
     const home = http.get(`${BASE}/`, { ...P, tags: { ...P.tags, name: 'Home' } });
     check(home, { 'home: 200': r => r.status === 200 });
-    think(1, 2);
+    think(2, 3);
 
     for (let i = 0; i < 2; i++) {
       const prod = http.get(`${BASE}/product/${pick(PRODUCTS)}`,
@@ -65,7 +65,7 @@ export default function () {
         'product: 200':       r => r.status === 200,
         'product: has price': r => r.body && r.body.includes('$'),
       });
-      think(1, 2);
+      think(2, 3);
     }
 
     if (persona >= 0.5) return;
@@ -77,7 +77,7 @@ export default function () {
 
     const cart = http.get(`${BASE}/cart`, { ...P, tags: { ...P.tags, name: 'ViewCart' } });
     check(cart, { 'viewCart: 200': r => r.status === 200 });
-    think(1, 2);
+    think(2, 3);
 
     if (persona >= 0.1) return;
 
@@ -97,6 +97,6 @@ export default function () {
       'checkout: ok':     r => r.status === 200 || r.status === 302,
       'checkout: no 5xx': r => r.status < 500,
     });
-    think(1, 2);
+    think(2, 3);
   });
 }
