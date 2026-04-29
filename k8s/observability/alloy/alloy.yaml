@@ -1,43 +1,39 @@
-# observability/alloy/alloy.yaml — Holy Grail Edition v4
+# observability/alloy/alloy.yaml — Holy Grail Edition v5
 # =============================================================================
-# CRITICAL FIX IN THIS VERSION:
+# FIXES IN THIS VERSION (v5):
 #
-# FIX — Alloy log tailing broken on Docker Desktop / macOS (ALL logs missing)
+# FIX 1 — Zombie tailer storm blocking log pipeline (root cause of missing logs)
 #
-#   Root cause: Docker Desktop on macOS runs Kubernetes inside a Linux VM.
-#   Container logs are written to /var/log/pods INSIDE that VM's filesystem.
-#   The Mac host does NOT have /var/log/pods — that path doesn't exist at
-#   the host level. Alloy's DaemonSet was mounting /var/log/pods from the
-#   Mac host (via hostPath), which is an empty or nonexistent directory.
-#   Result: every single log file stat() returned ENOENT → zero logs shipped
-#   to Loki → Loki appeared "broken" even though it was accepting pushes fine.
+#   Symptom: Alloy logs showed hundreds of "tailer stopped; will retry"
+#   warnings for deleted pods (HPA scale-down churn). These retry loops ran
+#   at ~200ms intervals, flooding the goroutine pool and starving active
+#   tailers from flushing to loki.write. Result: zero log lines reaching
+#   Loki despite Alloy showing "opened log stream" for every active pod.
 #
-#   You saw this exactly in the Alloy output:
-#     "stat /var/log/pods/55a8ce41.../adservice/*.log: no such file or directory"
-#     "stat /var/log/pods/44982b82.../currencyservice/*.log: no such file or directory"
-#     ... (50+ lines, every pod, every container)
+#   Fix: Added "Terminating" to the pod phase drop rule in discovery.relabel.
+#   Also added a deletion_timestamp drop rule to catch the Terminating window
+#   before the phase label updates (which can lag by several seconds).
+#   Also added pod_uid relabel for faster position file cursor cleanup.
 #
-#   Fix: Replace loki.source.file (hostPath file tailing) with
-#   loki.source.kubernetes_objects — this uses the Kubernetes API to stream
-#   pod logs directly. No host filesystem mounts needed. Works identically on:
-#     - Docker Desktop macOS (our setup)
-#     - Rancher Desktop macOS
-#     - Lima/Colima
-#     - EKS/AKS/GKE (where hostPath tailing works but API streaming also works)
+# FIX 2 — Wrong trace_id JSON field name (Tempo→Loki correlation broken)
 #
-#   The tradeoff: loki.source.kubernetes_objects doesn't support the CRI
-#   parsing pipeline (stage.cri, stage.json, etc.) directly. We handle this
-#   by keeping the loki.process pipeline — it still runs on the raw log lines
-#   which come pre-decoded (no CRI wrapping) from the API stream.
-#   The stage.cri{} call is removed (it would error on already-decoded lines).
+#   Symptom: Clicking a trace in Tempo opened Loki with a valid TraceQL
+#   query but returned "No logs found" — 996 kB processed, 0 results.
 #
-#   The DaemonSet still needs ALLOY_NODE_NAME for the OTLP pipeline node label.
-#   The hostPath volume mounts for /var/log/pods, /var/log/containers, and
-#   /var/lib/docker/containers are REMOVED — they served no purpose on macOS
-#   and were causing the misleading "stat failed" error storm.
+#   Root cause: stage.json was extracting "traceID" (uppercase D) but the
+#   OTel Go SDK actually emits "traceId" (camelCase, lowercase d). The
+#   extracted value was always empty → trace_id label always "" → derived
+#   field filter matched nothing.
 #
-# ALL OTHER CHANGES (traces pipeline, spanmetrics, Loki write, resources)
-# are identical to v3. Only the log collection method changed.
+# FIX 3 — trace_id moved from label to structured metadata
+#
+#   trace_id has per-request cardinality (one unique value per HTTP request).
+#   Using it as a Loki stream label would create millions of label index
+#   entries, cause ingester OOM, and break Loki's chunk compression.
+#   Structured metadata stores it inline with the log line, queryable via
+#   |= filter or the Grafana derived field link, without index overhead.
+#
+# UNCHANGED from v4: traces pipeline, spanmetrics, resources, DaemonSet spec.
 # =============================================================================
 
 apiVersion: v1
@@ -219,10 +215,23 @@ data:
     discovery.relabel "pod_logs" {
       targets = discovery.kubernetes.pods.targets
 
-      // Drop pods that aren't running
+      // Drop pods that aren't running.
+      // CRITICAL: "Terminating" is included to stop zombie tailer retry loops.
+      // Without this, HPA scale-down leaves deleted pod UIDs in the positions
+      // file; loki.source.kubernetes retries them in a tight loop (~200ms),
+      // flooding goroutines and starving active tailers from flushing to Loki.
+      // This was the root cause of zero logs reaching Loki during/after load tests.
       rule {
         source_labels = ["__meta_kubernetes_pod_phase"]
-        regex         = "Pending|Succeeded|Failed|Unknown"
+        regex         = "Pending|Succeeded|Failed|Unknown|Terminating"
+        action        = "drop"
+      }
+
+      // Drop pods with a deletion timestamp — catches the Terminating window
+      // before the phase label updates, which can lag by several seconds.
+      rule {
+        source_labels = ["__meta_kubernetes_pod_deletion_timestamp"]
+        regex         = ".+"
         action        = "drop"
       }
 
@@ -248,6 +257,13 @@ data:
       rule {
         source_labels = ["__meta_kubernetes_pod_label_app"]
         target_label  = "app"
+      }
+
+      // Set pod_uid — allows Alloy to clean up position file cursors faster
+      // when a pod is deleted (avoids stale cursor accumulation over time).
+      rule {
+        source_labels = ["__meta_kubernetes_pod_uid"]
+        target_label  = "pod_uid"
       }
     }
 
@@ -281,17 +297,30 @@ data:
 
       // Stage 3: attempt JSON parsing for structured log emitters.
       // frontend (Go/gin), checkoutservice (Go), productcatalog (Go) emit JSON.
+      // FIELD NAME FIX: OTel Go SDK injects "traceId" (camelCase, lowercase d),
+      // NOT "traceID" (uppercase D). The wrong key meant trace_id was always
+      // empty — the Tempo→Loki derived field click found no matching log lines.
       stage.json {
         expressions = {
           severity = "severity",
-          trace_id = "traceID",
+          trace_id = "traceId",
         }
       }
 
-      // Stage 4: promote extracted fields as Loki labels for correlation.
+      // Stage 4: severity stays a label (low cardinality: info/warn/error).
+      // trace_id moves to structured metadata — it has per-request cardinality
+      // (millions of unique values) which would bloat the Loki label index and
+      // cause OOM on the ingester if used as a stream label.
+      // Structured metadata is queryable via |= or the derived field link
+      // without being indexed as a label.
       stage.labels {
         values = {
           severity = "",
+        }
+      }
+
+      stage.structured_metadata {
+        values = {
           trace_id = "",
         }
       }
@@ -336,7 +365,7 @@ spec:
       labels:
         app: alloy
       annotations:
-        checksum/config: "v8-k8s-api-log-collection"
+        checksum/config: "v9-zombie-tailer-fix-traceid-structured-metadata"
     spec:
       serviceAccountName: alloy
       priorityClassName: system-node-critical
