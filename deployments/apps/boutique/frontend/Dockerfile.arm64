@@ -1,0 +1,24 @@
+# frontend/Dockerfile.arm64
+# =============================================================================
+# Patched frontend with sync.Once currency cache.
+# Eliminates GetSupportedCurrencies RPC on every page handler call.
+# Based on upstream v0.10.1 Dockerfile with arm64 native build.
+# =============================================================================
+FROM --platform=linux/arm64 golang:1.22-alpine AS builder
+
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+    go build -ldflags="-s -w" -o frontend .
+
+FROM --platform=linux/arm64 alpine:3.19
+RUN apk add --no-cache ca-certificates tzdata
+WORKDIR /app
+COPY --from=builder /app/frontend .
+COPY --from=builder /app/templates ./templates
+COPY --from=builder /app/static ./static
+ENV PORT=8080
+EXPOSE 8080
+ENTRYPOINT ["/app/frontend"]
