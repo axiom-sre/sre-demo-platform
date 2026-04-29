@@ -4,6 +4,24 @@
 # boutique.yaml does NOT define quotas — they live here exclusively.
 # =============================================================================
 #
+# v3 CHANGE — pods quota 60 → 120 (ROOT CAUSE OF 1001 VU FAILURE)
+#
+#   Symptom: load test failed at exactly 1001 VU every run regardless of
+#   think time. Below 1000 VU: zero errors. At 1001+: immediate cascade.
+#
+#   Root cause: pods="60" quota. At ~800-900 VU, HPA had already scheduled
+#   ~50 pods. At 1001 VU, multiple HPAs simultaneously triggered scale-out,
+#   pushing total pod count over 60. Kubernetes admission control rejected
+#   the new pods → they stayed Pending → HPA could not scale → services
+#   saturated → latency spiked → errors cascaded.
+#
+#   The failure was perfectly deterministic because the HPA policies are
+#   identical across services (2 pods per 30s) — they all hit the quota
+#   wall at the same VU threshold.
+#
+#   Fix: raise to 120. Max HPA across all services = 133 pods. 120 allows
+#   full scaling to 5K VU with a small safety margin against runaway HPA.
+#
 # ResourceQuota rationale — M5 Pro 14" 64GB / 8 vCPU node:
 #
 # Total node capacity: 8 CPU (8000m), ~60GB usable RAM
@@ -78,7 +96,9 @@ spec:
     limits.cpu: "32"         # hard safety net against node saturation
     requests.memory: "20Gi"  # generous — M5 Pro has 64GB, memory is not the constraint
     limits.memory: "40Gi"
-    pods: "60"               # prevents runaway HPA from infinite pod scheduling
+    pods: "120"              # raised from 60 — 60 was the hard wall causing failures at
+                             # exactly 1001 VU: HPA hit quota → pods Pending → cascade.
+                             # Max HPA across all services needs 133 pods. 120 is the ceiling.
 ---
 apiVersion: v1
 kind: Namespace

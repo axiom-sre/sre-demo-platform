@@ -1,0 +1,181 @@
+# k6-job.yaml — In-cluster k6 capacity load test
+# =============================================================================
+# WHY IN-CLUSTER:
+#   Running k6 from Mac → Docker Desktop NAT → kernel SYN queue limit (~1024
+#   concurrent connections). Above 1000 VU the SYN backlog overflows and the
+#   kernel silently drops new connections. k6 sees EOF. Nothing reaches the
+#   app. Grafana shows 0 errors because the requests never entered the cluster.
+#
+#   In-cluster k6 hits frontend.boutique.svc.cluster.local directly over the
+#   pod network — no NAT, no SYN queue, no Docker Desktop involved. The only
+#   limit is the app itself. This is the correct way to capacity test.
+#
+# USAGE:
+#   # Run the test
+#   kubectl apply -f k8s/scripts/k6-job.yaml
+#
+#   # Watch live output
+#   kubectl logs -n boutique -l job-name=k6-capacity -f
+#
+#   # Clean up after
+#   kubectl delete -f k8s/scripts/k6-job.yaml
+#
+# RESOURCE BUDGET:
+#   k6 at 2000 VU uses ~1-2 CPU and ~512Mi RAM on arm64.
+#   Runs in boutique namespace so it counts against boutique-quota.
+#   requests.cpu=1000m, limits.cpu=2000m fits within the 16 CPU quota.
+# =============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k6-script
+  namespace: boutique
+data:
+  load-test.js: |
+    import http from 'k6/http';
+    import { sleep, check, group } from 'k6';
+
+    // IN-CLUSTER: hits frontend service directly — no Docker Desktop NAT
+    const BASE = __ENV.BASE_URL || 'http://frontend.boutique.svc.cluster.local:8080';
+
+    const P = {
+      timeout: '60s',
+      tags: { test: 'capacityvu-smoke' },
+    };
+
+    const PRODUCTS = [
+      'OLJCESPC7Z', '66VCHSJNUP', '1YMWWN1N4O', '0PUK6V6EV0', '2ZYFJ3GM2N',
+      'L9ECAV7KIM', 'LS4PSXUNUM', '9SIQT8TOJO', '6E92ZMYYFZ',
+    ];
+
+    export const options = {
+      stages: [
+        { duration: '1m',  target: 10   },
+        { duration: '5m',  target: 500  },
+        { duration: '1m',  target: 500  },
+        { duration: '5m',  target: 750  },
+        { duration: '1m',  target: 750  },
+        { duration: '3m',  target: 1000 },
+        { duration: '5m',  target: 1000 },
+        { duration: '3m',  target: 1250 },
+        { duration: '5m',  target: 1250 },
+        { duration: '3m',  target: 1500 },
+        { duration: '5m',  target: 1500 },
+        { duration: '3m',  target: 1750 },
+        { duration: '5m',  target: 1750 },
+        { duration: '3m',  target: 2000 },
+        { duration: '5m',  target: 2000 },
+        { duration: '1m',  target: 0    },
+      ],
+      thresholds: {
+        http_req_failed:   ['rate<0.001'],
+        http_req_duration: ['p(95)<1000'],
+      },
+      summaryTrendStats: ['avg', 'min', 'med', 'max', 'p(90)', 'p(95)', 'p(99)'],
+    };
+
+    function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+    function think(lo, hi) { sleep(Math.random() * (hi - lo) + lo); }
+
+    export default function () {
+      const persona = Math.random();
+
+      group('session', () => {
+
+        const home = http.get(`${BASE}/`, { ...P, tags: { ...P.tags, name: 'Home' } });
+        check(home, { 'home: 200': r => r.status === 200 });
+        think(2, 5);
+
+        for (let i = 0; i < 2; i++) {
+          const prod = http.get(`${BASE}/product/${pick(PRODUCTS)}`,
+            { ...P, tags: { ...P.tags, name: 'ProductPage' } });
+          check(prod, {
+            'product: 200':       r => r.status === 200,
+            'product: has price': r => r.body && r.body.includes('$'),
+          });
+          think(2, 5);
+        }
+
+        if (persona >= 0.5) return;
+
+        const add = http.post(`${BASE}/cart`,
+          { product_id: pick(PRODUCTS), quantity: '1' },
+          { ...P, tags: { ...P.tags, name: 'AddToCart' } });
+        check(add, { 'addToCart: 200 or 302': r => r.status === 200 || r.status === 302 });
+
+        const cart = http.get(`${BASE}/cart`, { ...P, tags: { ...P.tags, name: 'ViewCart' } });
+        check(cart, { 'viewCart: 200': r => r.status === 200 });
+        think(2, 5);
+
+        if (persona >= 0.2) return;
+
+        const co = http.post(`${BASE}/cart/checkout`, {
+          email:                        'sre-smoke@example.com',
+          street_address:               '1 Smoke Lane',
+          zip_code:                     '10001',
+          city:                         'SmokeCity',
+          state:                        'CA',
+          country:                      'US',
+          credit_card_number:           '4432801561520454',
+          credit_card_expiration_month: '1',
+          credit_card_expiration_year:  '2030',
+          credit_card_cvv:              '672',
+        }, { ...P, tags: { ...P.tags, name: 'Checkout' } });
+        check(co, {
+          'checkout: ok':     r => r.status === 200 || r.status === 302,
+          'checkout: no 5xx': r => r.status < 500,
+        });
+        think(2, 5);
+      });
+    }
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: k6-capacity
+  namespace: boutique
+  labels:
+    app: k6
+    test: capacity
+spec:
+  # Never restart — if k6 exits (pass or fail) we want the logs preserved
+  backoffLimit: 0
+  # Auto-cleanup 10 minutes after completion so logs survive for review
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: k6
+        test: capacity
+    spec:
+      restartPolicy: Never
+      # Run at background priority — don't compete with boutique pods
+      priorityClassName: boutique-background
+      containers:
+        - name: k6
+          image: grafana/k6:latest
+          args:
+            - run
+            - /scripts/load-test.js
+            - --out
+            - json=/tmp/results.json
+          env:
+            - name: BASE_URL
+              value: "http://frontend.boutique.svc.cluster.local:8080"
+            - name: K6_NO_COLOR
+              value: "false"
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+          resources:
+            requests:
+              cpu:    1000m
+              memory: 512Mi
+            limits:
+              cpu:    2000m
+              memory: 1Gi
+      volumes:
+        - name: script
+          configMap:
+            name: k6-script

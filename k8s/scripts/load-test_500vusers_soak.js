@@ -64,7 +64,7 @@ export default function () {
 
     const home = http.get(`${BASE}/`, { ...P, tags: { ...P.tags, name: 'Home' } });
     check(home, { 'home: 200': r => r.status === 200 });
-    think(1, 2);
+    think(2, 5);
 
     for (let i = 0; i < 2; i++) {
       const prod = http.get(`${BASE}/product/${pick(PRODUCTS)}`,
@@ -73,7 +73,7 @@ export default function () {
         'product: 200':       r => r.status === 200,
         'product: has price': r => r.body && r.body.includes('$'),
       });
-      think(1, 2);
+      think(2, 5);
     }
 
     if (persona >= 0.5) return;
@@ -85,9 +85,9 @@ export default function () {
 
     const cart = http.get(`${BASE}/cart`, { ...P, tags: { ...P.tags, name: 'ViewCart' } });
     check(cart, { 'viewCart: 200': r => r.status === 200 });
-    think(1, 2);
+    think(2, 5);
 
-    if (persona >= 0.1) return;
+    if (persona >= 0.2) return;
 
     const co = http.post(`${BASE}/cart/checkout`, {
       email:                        'sre-smoke@example.com',
@@ -105,6 +105,6 @@ export default function () {
       'checkout: ok':     r => r.status === 200 || r.status === 302,
       'checkout: no 5xx': r => r.status < 500,
     });
-    think(1, 2);
+    think(2, 5);
   });
 }

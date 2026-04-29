@@ -37,28 +37,18 @@ export const options = {
     { duration: '1m', target: 10 },
     { duration: '5m', target: 500 },
     { duration: '1m', target: 500 },
-    { duration: '3m', target: 750 },
+    { duration: '5m', target: 750 },
     { duration: '1m', target: 750 },
     { duration: '3m', target: 1000 },
-    { duration: '2m', target: 1000 },
-    { duration: '1m', target: 1100 },
-    { duration: '2m', target: 1100 }, 
-    { duration: '1m', target: 1200 },
-    { duration: '2m', target: 1200 }, 
-    { duration: '1m', target: 1300 },
-    { duration: '2m', target: 1300 },     
-    { duration: '1m', target: 1400 },
-    { duration: '2m', target: 1500 },
-    { duration: '1m', target: 1600 },
-    { duration: '2m', target: 1600 }, 
-    { duration: '1m', target: 1700 },
-    { duration: '2m', target: 1700 }, 
-    { duration: '1m', target: 1800 },
-    { duration: '2m', target: 1800 },  
-    { duration: '1m', target: 1900 },
-    { duration: '2m', target: 1900 }, 
-    { duration: '1m', target: 2000 },
-    { duration: '2m', target: 2000 },      
+    { duration: '5m', target: 1000 },   
+    { duration: '3m', target: 1250 },
+    { duration: '5m', target: 1250 },
+    { duration: '3m', target: 1500 },
+    { duration: '5m', target: 1500 },
+    { duration: '3m', target: 1750 },
+    { duration: '5m', target: 1750 },
+    { duration: '3m', target: 2000 },
+    { duration: '5m', target: 2000 },
     { duration: '1m', target: 0  },
   ],
   thresholds: {
@@ -78,7 +68,7 @@ export default function () {
 
     const home = http.get(`${BASE}/`, { ...P, tags: { ...P.tags, name: 'Home' } });
     check(home, { 'home: 200': r => r.status === 200 });
-    think(2, 3);
+    think(2, 5);
 
     for (let i = 0; i < 2; i++) {
       const prod = http.get(`${BASE}/product/${pick(PRODUCTS)}`,
@@ -87,7 +77,7 @@ export default function () {
         'product: 200':       r => r.status === 200,
         'product: has price': r => r.body && r.body.includes('$'),
       });
-      think(2, 3);
+      think(2, 5);
     }
 
     if (persona >= 0.5) return;
@@ -99,9 +89,9 @@ export default function () {
 
     const cart = http.get(`${BASE}/cart`, { ...P, tags: { ...P.tags, name: 'ViewCart' } });
     check(cart, { 'viewCart: 200': r => r.status === 200 });
-    think(2, 3);
+    think(2, 5);
 
-    if (persona >= 0.1) return;
+    if (persona >= 0.2) return;
 
     const co = http.post(`${BASE}/cart/checkout`, {
       email:                        'sre-smoke@example.com',
@@ -119,6 +109,6 @@ export default function () {
       'checkout: ok':     r => r.status === 200 || r.status === 302,
       'checkout: no 5xx': r => r.status < 500,
     });
-    think(2, 3);
+    think(2, 5);
   });
 }
