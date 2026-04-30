@@ -497,7 +497,9 @@
             ],
             "displayMode": "table",
             "placement": "bottom",
-            "showLegend": true
+            "showLegend": true,
+            "sortBy": "Max",
+            "sortDesc": true
           },
           "tooltip": {
             "mode": "multi",
@@ -608,7 +610,7 @@
               "uid": "prometheus"
             },
             "editorMode": "code",
-            "expr": "sum by (container) (\n  rate(container_cpu_usage_seconds_total{\n    namespace=\"boutique\",\n    container!=\"\",\n    container!=\"POD\"\n  }[2m])\n) * 1000",
+            "expr": "avg by (container) (\n  container_memory_working_set_bytes{\n    namespace=\"boutique\",\n    container!=\"\",\n    container!=\"POD\"\n  }\n  /\n  container_spec_memory_limit_bytes{\n    namespace=\"boutique\",\n    container!=\"\",\n    container!=\"POD\"\n  }\n) * 100",
             "legendFormat": "{{service}}",
             "range": true,
             "refId": "A"
