@@ -162,8 +162,10 @@
             "datasource": {
               "uid": "prometheus"
             },
-            "expr": "1 - (sum(rate(traces_spanmetrics_calls_total{status_code=\"STATUS_CODE_ERROR\"}[30d])) / sum(rate(traces_spanmetrics_calls_total[30d])) / (1 - 0.999))",
+            "editorMode": "code",
+            "expr": "1 - (sum(rate(traces_spanmetrics_calls_total{status_code=\"STATUS_CODE_ERROR\"}[30d])) / sum(rate(traces_spanmetrics_calls_total[30d])) / (1 - 0.99))",
             "legendFormat": "Budget remaining",
+            "range": true,
             "refId": "A"
           }
         ],
@@ -767,7 +769,9 @@
             ],
             "displayMode": "table",
             "placement": "right",
-            "showLegend": true
+            "showLegend": true,
+            "sortBy": "Max",
+            "sortDesc": true
           },
           "tooltip": {
             "mode": "multi",
